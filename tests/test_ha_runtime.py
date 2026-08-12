@@ -1,0 +1,1163 @@
+"""Synthetic tests for the dynamic Home Assistant runtime slice."""
+
+# Imports must follow the dynamic sys.modules/sys.path Home Assistant stub bootstrap.
+# ruff: noqa: E402
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextvars
+import importlib
+import sys
+from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
+from typing import Any
+
+import pytest
+
+# Pure API tests install a package placeholder in conftest. Replace it so this
+# module exercises the real HA package initializer against the lightweight stubs.
+for module_name in tuple(sys.modules):
+    if module_name == "custom_components.ufanet_intercom" or module_name.startswith(
+        "custom_components.ufanet_intercom."
+    ):
+        del sys.modules[module_name]
+sys.path.insert(0, str(Path(__file__).parent))
+import ha_stub_import  # noqa: F401
+
+runtime_module = importlib.import_module("custom_components.ufanet_intercom")
+coordinator_module = importlib.import_module(
+    "custom_components.ufanet_intercom.coordinator"
+)
+diagnostics_module = importlib.import_module(
+    "custom_components.ufanet_intercom.diagnostics"
+)
+lock_module = importlib.import_module("custom_components.ufanet_intercom.lock")
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+)
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from custom_components.ufanet_intercom.api import (
+    UfanetAuthenticationError,
+    UfanetConcurrentOpenError,
+    UfanetConnectionError,
+    UfanetOpenError,
+    UfanetOpenUnknownOutcome,
+)
+from custom_components.ufanet_intercom.const import (
+    CONF_CONTRACT,
+    CONF_IDENTITY_KEY,
+    CONF_PASSWORD,
+    CONF_REQUIRES_ACK,
+    CONF_TRUSTED_BINDINGS,
+    DOMAIN,
+    DiscoveredDoor,
+)
+
+IDENTITY_KEY = bytes(range(32))
+ENCODED_IDENTITY_KEY = base64.urlsafe_b64encode(IDENTITY_KEY).decode("ascii")
+
+
+def door(
+    digit: str,
+    *,
+    trusted: bool = True,
+    openable: bool = True,
+    display_name: str = "Synthetic lobby",
+    shared_id: int = 1001,
+    binding_digit: str | None = None,
+) -> DiscoveredDoor:
+    return DiscoveredDoor(
+        key=digit * 64,
+        shared_id=shared_id,
+        door=0,
+        model=21,
+        display_name=display_name,
+        binding=(binding_digit or digit) * 64,
+        openable=openable,
+        trusted=trusted,
+    )
+
+
+class FakeConfigEntries:
+    def __init__(self, *, unload_result: bool = True) -> None:
+        self.forwarded: list[tuple[Any, tuple[str, ...]]] = []
+        self.unload_result = unload_result
+        self.events: list[str] = []
+        self.updated: dict[str, Any] | None = None
+        self.update_calls: list[tuple[Any, dict[str, Any]]] = []
+
+    async def async_forward_entry_setups(
+        self, entry: Any, platforms: tuple[str, ...]
+    ) -> None:
+        self.forwarded.append((entry, platforms))
+
+    async def async_unload_platforms(
+        self, _entry: Any, _platforms: tuple[str, ...]
+    ) -> bool:
+        self.events.append("unload")
+        return self.unload_result
+
+    def async_update_entry(self, entry: Any, **updates: Any) -> None:
+        self.updated = updates
+        self.update_calls.append((entry, updates))
+        for attribute, value in updates.items():
+            setattr(entry, attribute, value)
+
+
+def config_data(**updates: Any) -> dict[str, Any]:
+    data = {
+        CONF_CONTRACT: "SYNTHETIC",
+        CONF_PASSWORD: "synthetic-password",
+        CONF_IDENTITY_KEY: ENCODED_IDENTITY_KEY,
+        CONF_TRUSTED_BINDINGS: {"a" * 64: "a" * 64},
+        CONF_REQUIRES_ACK: False,
+    }
+    data.update(updates)
+    return data
+
+
+def acknowledged_entry(**updates: Any) -> ConfigEntry:
+    """Return an entry whose current runtime acknowledgement is exact False."""
+
+    return ConfigEntry(data=config_data(**updates), version=2)
+
+
+def coordinator_snapshot(
+    targets: dict[str, DiscoveredDoor],
+    *,
+    entry: ConfigEntry | None = None,
+) -> DataUpdateCoordinator:
+    """Build a listener-capable coordinator with safe config-entry context."""
+
+    coordinator = DataUpdateCoordinator(
+        object(), object(), config_entry=entry or acknowledged_entry()
+    )
+    coordinator.data = MappingProxyType(targets)
+    coordinator.last_update_success = True
+    return coordinator
+
+
+_MISSING_ACK = object()
+
+
+def set_current_ack(entry: ConfigEntry, value: object) -> None:
+    """Replace the current immutable-style entry data acknowledgement value."""
+
+    data = dict(entry.data)
+    if value is _MISSING_ACK:
+        data.pop(CONF_REQUIRES_ACK, None)
+    else:
+        data[CONF_REQUIRES_ACK] = value
+    entry.data = data
+
+
+def test_runtime_transport_guard_requires_exact_connector_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExpectedConnector:
+        pass
+
+    class ExpectedSession:
+        def __init__(self, connector: object) -> None:
+            self.connector = connector
+            self._retry_connection = False
+            self._middlewares: tuple[Any, ...] = ()
+            self.headers: dict[str, str] = {}
+            self.timeout = SimpleNamespace(total=15)
+
+    monkeypatch.setattr(runtime_module, "ClientSession", ExpectedSession)
+    monkeypatch.setattr(runtime_module, "TCPConnector", ExpectedConnector)
+    read_session = ExpectedSession(ExpectedConnector())
+    open_session = ExpectedSession(ExpectedConnector())
+
+    assert runtime_module._sessions_are_safe(read_session, open_session)
+    open_session.connector = object()
+    assert not runtime_module._sessions_are_safe(read_session, open_session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "acknowledgement",
+    [_MISSING_ACK, True, 0, 1, "false", "private-ack-token", None],
+    ids=["missing", "true", "zero", "one", "false-string", "secret-string", "none"],
+)
+async def test_setup_rejects_non_exact_ack_before_any_runtime_work(
+    monkeypatch: pytest.MonkeyPatch,
+    acknowledgement: object,
+) -> None:
+    effects: list[str] = []
+
+    class Session:
+        async def close(self) -> None:
+            effects.append("session-close")
+
+    def new_session() -> Session:
+        effects.append("new-session")
+        return Session()
+
+    class Client:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            effects.append("client")
+
+    class Coordinator:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            effects.append("coordinator")
+
+        async def async_config_entry_first_refresh(self) -> None:
+            effects.append("discovery")
+
+    class ConfigEntries(FakeConfigEntries):
+        async def async_forward_entry_setups(
+            self, entry: Any, platforms: tuple[str, ...]
+        ) -> None:
+            effects.append("forward")
+            await super().async_forward_entry_setups(entry, platforms)
+
+    monkeypatch.setattr(runtime_module, "_new_session", new_session)
+    monkeypatch.setattr(runtime_module, "_sessions_are_safe", lambda *_args: True)
+    monkeypatch.setattr(runtime_module, "UfanetClient", Client)
+    monkeypatch.setattr(runtime_module, "UfanetCoordinator", Coordinator)
+    entry = acknowledged_entry()
+    set_current_ack(entry, acknowledgement)
+    hass = SimpleNamespace(config_entries=ConfigEntries())
+
+    with pytest.raises(Exception) as raised:
+        await runtime_module.async_setup_entry(hass, entry)
+
+    assert effects == []
+    assert entry.runtime_data is None
+    assert hass.config_entries.forwarded == []
+    assert "private-ack-token" not in str(raised.value)
+
+
+def test_retry_disabling_requires_an_existing_boolean_attribute() -> None:
+    missing = SimpleNamespace()
+    assert runtime_module._disable_implicit_retry(missing) is False
+    assert "_retry_connection" not in vars(missing)
+
+    for malformed in (None, 0, "false", object()):
+        session = SimpleNamespace(_retry_connection=malformed)
+        assert runtime_module._disable_implicit_retry(session) is False
+        assert session._retry_connection is malformed
+
+    inspectable = SimpleNamespace(_retry_connection=True)
+    assert runtime_module._disable_implicit_retry(inspectable) is True
+    assert inspectable._retry_connection is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_case", ["missing", "malformed"])
+async def test_setup_fails_closed_when_retry_disabling_cannot_be_proven(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_case: str,
+) -> None:
+    sessions: list[Any] = []
+
+    class UnsafeSession:
+        def __init__(
+            self, *, connector: object, timeout: object, middlewares: object
+        ) -> None:
+            self.connector = connector
+            self.timeout = timeout
+            self._middlewares = middlewares
+            self.headers: dict[str, str] = {}
+            self.closed = False
+            if retry_case == "malformed":
+                self._retry_connection = "not-a-boolean"
+            sessions.append(self)
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(runtime_module, "ClientSession", UnsafeSession)
+    monkeypatch.setattr(runtime_module, "TCPConnector", object)
+    hass = SimpleNamespace(config_entries=FakeConfigEntries())
+    entry = SimpleNamespace(data=config_data(), runtime_data=None)
+
+    with pytest.raises(
+        ConfigEntryNotReady,
+        match="^Safe isolated HTTP transports are unavailable$",
+    ):
+        await runtime_module.async_setup_entry(hass, entry)
+
+    assert len(sessions) == 2
+    assert all(session.closed for session in sessions)
+    if retry_case == "missing":
+        assert all("_retry_connection" not in vars(session) for session in sessions)
+    else:
+        assert all(session._retry_connection == "not-a-boolean" for session in sessions)
+    assert hass.config_entries.forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_setup_owns_two_safe_sessions_and_performs_no_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovered = MappingProxyType({"a" * 64: door("a")})
+    clients: list[Any] = []
+
+    class FakeClient:
+        def __init__(self, read_session: Any, *_args: Any, **kwargs: Any) -> None:
+            self.read_session = read_session
+            self.open_session = kwargs["open_session"]
+            self.identity_key = kwargs["identity_key"]
+            self.trusted_bindings = kwargs["trusted_bindings"]
+            self.open_calls = 0
+            clients.append(self)
+
+        async def async_update_inventory(self) -> Any:
+            return discovered
+
+    monkeypatch.setattr(runtime_module, "UfanetClient", FakeClient)
+    config_entries = FakeConfigEntries()
+    hass = SimpleNamespace(config_entries=config_entries)
+    entry = SimpleNamespace(data=config_data(), runtime_data=None)
+
+    assert await runtime_module.async_setup_entry(hass, entry) is True
+    client = clients[0]
+    read_session, open_session = client.read_session, client.open_session
+    assert type(read_session) is type(open_session) is runtime_module.ClientSession
+    assert read_session.connector is not None
+    assert open_session.connector is not None
+    assert read_session.connector is not open_session.connector
+    for session in (read_session, open_session):
+        assert session._retry_connection is False
+        assert session._middlewares == ()
+        assert "Authorization" not in session.headers
+        assert 0 < session.timeout.total <= 30
+    assert client.identity_key == IDENTITY_KEY
+    assert client.trusted_bindings == config_data()[CONF_TRUSTED_BINDINGS]
+    assert client.open_calls == 0
+    assert entry.runtime_data.coordinator.data == discovered
+    assert config_entries.forwarded == [(entry, ("lock",))]
+
+    await read_session.close()
+    await open_session.close()
+
+
+@pytest.mark.asyncio
+async def test_setup_failure_closes_both_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions: list[Any] = []
+
+    class RejectingClient:
+        def __init__(self, read_session: Any, *_args: Any, **kwargs: Any) -> None:
+            sessions.extend((read_session, kwargs["open_session"]))
+
+        async def async_update_inventory(self) -> Any:
+            raise UfanetConnectionError("private detail")
+
+    monkeypatch.setattr(runtime_module, "UfanetClient", RejectingClient)
+    hass = SimpleNamespace(config_entries=FakeConfigEntries())
+    entry = SimpleNamespace(data=config_data(), runtime_data=None)
+
+    with pytest.raises(UpdateFailed, match="^Ufanet door availability update failed$"):
+        await runtime_module.async_setup_entry(hass, entry)
+    assert len(sessions) == 2
+    assert all(session.closed for session in sessions)
+    assert hass.config_entries.forwarded == []
+
+
+@pytest.mark.asyncio
+async def test_coordinator_replaces_omitted_data_and_maps_fixed_errors() -> None:
+    first = {"a" * 64: door("a"), "b" * 64: door("b", shared_id=1002)}
+    second = {"b" * 64: first["b" * 64]}
+
+    class Client:
+        def __init__(self) -> None:
+            self.results: list[Any] = [first, second]
+
+        async def async_update_inventory(self) -> Any:
+            result = self.results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    client = Client()
+    coordinator = coordinator_module.UfanetCoordinator(object(), object(), client)
+    # Availability and trust are intentionally excluded from DiscoveredDoor
+    # identity equality. The coordinator must therefore always notify listeners
+    # after a successful fresh inventory so blocked/quarantined targets become
+    # unavailable immediately in Home Assistant.
+    assert coordinator.always_update is True
+    initial = await coordinator._async_update_data()
+    assert set(initial) == {"a" * 64, "b" * 64}
+    with pytest.raises(TypeError):
+        initial["c" * 64] = door("c")
+    current = await coordinator._async_update_data()
+    assert set(current) == {"b" * 64}
+
+    client.results = [UfanetAuthenticationError("provider secret")]
+    with pytest.raises(ConfigEntryAuthFailed) as auth:
+        await coordinator._async_update_data()
+    assert str(auth.value) == "Ufanet authentication failed"
+    client.results = [UfanetConnectionError("provider secret")]
+    with pytest.raises(UpdateFailed) as update:
+        await coordinator._async_update_data()
+    assert str(update.value) == "Ufanet door availability update failed"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_locks_use_only_opaque_identity_and_strict_availability() -> None:
+    trusted = door("a", display_name="Provider display")
+    untrusted = door("b", trusted=False, shared_id=1002)
+    entry = acknowledged_entry()
+    coordinator = coordinator_snapshot(
+        {trusted.key: trusted, untrusted.key: untrusted}, entry=entry
+    )
+
+    class Client:
+        async def async_open(self, _key: str) -> None:
+            return None
+
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator, client=Client())
+    entities: list[Any] = []
+    await lock_module.async_setup_entry(
+        None, entry, lambda values: entities.extend(values)
+    )
+
+    assert len(entities) == 1
+    entity = entities[0]
+    assert entity._attr_unique_id == trusted.key
+    assert entity._attr_name == "Provider display"
+    assert entity.entity_id == f"lock.{trusted.suggested_object_id}"
+    assert "provider" not in entity.entity_id
+    assert entity._attr_device_info == {
+        "identifiers": {(DOMAIN, trusted.key)},
+        "name": "Provider display",
+    }
+    assert entity._attr_supported_features == lock_module.LockEntityFeature.OPEN
+    assert entity._attr_assumed_state is True
+    assert entity.is_locked is None
+    assert entity.available is True
+
+    coordinator.data = MappingProxyType({})
+    assert entity.available is False
+    coordinator.data = MappingProxyType(
+        {trusted.key: door("a", trusted=False, display_name="changed")}
+    )
+    assert entity.available is False
+    coordinator.data = MappingProxyType(
+        {trusted.key: door("a", openable=False, display_name="changed")}
+    )
+    assert entity.available is False
+    coordinator.data = MappingProxyType(
+        {trusted.key: door("a", binding_digit="c", display_name="changed")}
+    )
+    assert entity.available is False
+    coordinator.last_update_success = False
+    coordinator.data = MappingProxyType({trusted.key: trusted})
+    assert entity.available is False
+
+
+@pytest.mark.asyncio
+async def test_lock_setup_listens_for_new_trusted_targets_and_uses_opaque_names() -> (
+    None
+):
+    duplicate_a = door("a", display_name="Shared name")
+    duplicate_b = door("b", display_name="Shared name", shared_id=1002)
+    unique = door("c", display_name="Unique name", shared_id=1003)
+    fallback = door("d", display_name="Ufanet intercom", shared_id=1004)
+    ignored = door(
+        "e", display_name="Private ignored name", trusted=False, shared_id=1005
+    )
+    later = door("f", display_name="Later unique name", shared_id=1006)
+    later_untrusted = door(
+        "9", display_name="Private later name", trusted=False, shared_id=1007
+    )
+    initial = {
+        target.key: target
+        for target in (duplicate_a, duplicate_b, unique, fallback, ignored)
+    }
+    entry = acknowledged_entry()
+    coordinator = coordinator_snapshot(initial, entry=entry)
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator, client=object())
+    add_batches: list[list[Any]] = []
+
+    await lock_module.async_setup_entry(
+        None, entry, lambda values: add_batches.append(list(values))
+    )
+
+    initial_entities = add_batches[0]
+    assert {entity._attr_unique_id for entity in initial_entities} == {
+        duplicate_a.key,
+        duplicate_b.key,
+        unique.key,
+        fallback.key,
+    }
+    entities_by_key = {entity._attr_unique_id: entity for entity in initial_entities}
+    assert entities_by_key[duplicate_a.key]._attr_name == "Shared name (aaaaaaaa)"
+    assert entities_by_key[duplicate_b.key]._attr_name == "Shared name (bbbbbbbb)"
+    assert entities_by_key[unique.key]._attr_name == "Unique name"
+    assert entities_by_key[fallback.key]._attr_name == "Ufanet intercom (dddddddd)"
+    for target in (duplicate_a, duplicate_b, unique, fallback):
+        entity = entities_by_key[target.key]
+        assert entity.entity_id == f"lock.{target.suggested_object_id}"
+        assert entity._attr_device_info["name"] == entity._attr_name
+
+    assert len(coordinator.listeners) == 1
+    assert len(entry.unload_callbacks) == 1
+
+    with_later = {**initial, later.key: later}
+    coordinator.async_set_updated_data(MappingProxyType(with_later))
+    coordinator.async_set_updated_data(MappingProxyType(dict(with_later)))
+    coordinator.async_set_updated_data(
+        MappingProxyType({**with_later, later_untrusted.key: later_untrusted})
+    )
+
+    all_entities = [entity for batch in add_batches for entity in batch]
+    assert [entity._attr_unique_id for entity in all_entities].count(later.key) == 1
+    assert later_untrusted.key not in {
+        entity._attr_unique_id for entity in all_entities
+    }
+    later_entity = next(
+        entity for entity in all_entities if entity._attr_unique_id == later.key
+    )
+    assert later_entity._attr_name == "Later unique name"
+    assert later_entity.entity_id == f"lock.{later.suggested_object_id}"
+    assert later_entity._attr_device_info["name"] == later_entity._attr_name
+
+    entry.unload_callbacks[0]()
+    assert coordinator.listeners == []
+
+
+@pytest.mark.parametrize(
+    "acknowledgement",
+    [_MISSING_ACK, True, 0, 1, "false", "private-ack-token", None],
+    ids=["missing", "true", "zero", "one", "false-string", "secret-string", "none"],
+)
+def test_entity_is_unavailable_when_current_ack_is_not_exact_false(
+    acknowledgement: object,
+) -> None:
+    target = door("a")
+    entry = acknowledged_entry()
+    coordinator = coordinator_snapshot({target.key: target}, entry=entry)
+    client = SimpleNamespace()
+    entity = lock_module.UfanetDoorLock(coordinator, client, target)
+    assert entity.available is True
+
+    set_current_ack(entry, acknowledgement)
+
+    assert entity.available is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "acknowledgement",
+    [_MISSING_ACK, True, 0, 1, "false", "private-ack-token", None],
+    ids=["missing", "true", "zero", "one", "false-string", "secret-string", "none"],
+)
+async def test_open_rejects_current_non_exact_ack_without_calling_client(
+    acknowledgement: object,
+) -> None:
+    target = door("a")
+    entry = acknowledged_entry()
+    coordinator = coordinator_snapshot({target.key: target}, entry=entry)
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def async_open(self, key: str) -> None:
+            self.calls.append(key)
+
+    client = Client()
+    entity = lock_module.UfanetDoorLock(coordinator, client, target)
+    set_current_ack(entry, acknowledgement)
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await entity.async_open()
+    assert client.calls == []
+    assert "private-ack-token" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_open_passes_only_fixed_key_and_maps_unknown_but_preserves_cancel() -> (
+    None
+):
+    target = door("a")
+    coordinator = coordinator_snapshot({target.key: target})
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+            self.error: BaseException | None = None
+            self.last_physical_outcome: str | None = None
+
+        async def async_open(self, *args: Any, **kwargs: Any) -> None:
+            self.calls.append((args, kwargs))
+            self.last_physical_outcome = None
+            if self.error is not None:
+                if isinstance(self.error, UfanetOpenUnknownOutcome):
+                    self.last_physical_outcome = "unknown"
+                raise self.error
+            self.last_physical_outcome = "confirmed"
+
+    client = Client()
+    entity = lock_module.UfanetDoorLock(coordinator, client, target)
+    await entity.async_open(hostile="ignored")
+    assert client.calls == [((target.key,), {})]
+    assert entity.extra_state_attributes == {
+        "last_command_outcome": "confirmed",
+        "do_not_retry": False,
+    }
+
+    client.error = UfanetOpenUnknownOutcome("provider detail")
+    with pytest.raises(HomeAssistantError) as unknown:
+        await entity.async_open()
+    assert str(unknown.value) == (
+        "Door opening outcome is unknown; the command was not repeated"
+    )
+    assert entity.extra_state_attributes == {
+        "last_command_outcome": "unknown",
+        "do_not_retry": True,
+    }
+
+    cancellation = asyncio.CancelledError("preserved")
+    client.error = cancellation
+    writes_before_cancel = entity.state_writes
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await entity.async_open()
+    assert cancelled.value is cancellation
+    assert entity.extra_state_attributes == {
+        "last_command_outcome": "unknown",
+        "do_not_retry": True,
+    }
+    assert entity.state_writes == writes_before_cancel
+    assert entity.is_locked is None
+
+
+@pytest.mark.asyncio
+async def test_post_transmission_cancel_sets_unknown_once_and_preserves_identity() -> (
+    None
+):
+    target = door("a")
+    coordinator = coordinator_snapshot({target.key: target})
+    cancellation = asyncio.CancelledError("preserved-private-detail")
+
+    class Client:
+        def __init__(self) -> None:
+            self._last_physical_outcome: str | None = None
+
+        @property
+        def last_physical_outcome(self) -> str | None:
+            return self._last_physical_outcome
+
+        async def async_open(self, _key: str) -> None:
+            self._last_physical_outcome = "unknown"
+            raise cancellation
+
+    entity = lock_module.UfanetDoorLock(coordinator, Client(), target)
+
+    with pytest.raises(asyncio.CancelledError) as cancelled:
+        await entity.async_open()
+
+    assert cancelled.value is cancellation
+    assert entity.extra_state_attributes == {
+        "last_command_outcome": "unknown",
+        "do_not_retry": True,
+    }
+    assert entity.state_writes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_error", "physical_outcome", "message", "attributes"),
+    [
+        (
+            UfanetOpenUnknownOutcome("private unknown detail"),
+            "unknown",
+            "Door opening outcome is unknown; the command was not repeated",
+            {"last_command_outcome": "unknown", "do_not_retry": True},
+        ),
+        (
+            UfanetConcurrentOpenError("private concurrent detail"),
+            None,
+            "Another door command is already in progress",
+            {"last_command_outcome": "none", "do_not_retry": False},
+        ),
+        (
+            UfanetOpenError("private not-confirmed detail"),
+            "not_confirmed",
+            "Door opening was not confirmed",
+            {"last_command_outcome": "not_confirmed", "do_not_retry": False},
+        ),
+    ],
+)
+async def test_open_maps_fixed_ha_errors_without_provider_exception_context(
+    provider_error: BaseException,
+    physical_outcome: str | None,
+    message: str,
+    attributes: dict[str, str | bool],
+) -> None:
+    target = door("a")
+    coordinator = coordinator_snapshot({target.key: target})
+
+    class Client:
+        last_physical_outcome: str | None = None
+
+        async def async_open(self, _key: str) -> None:
+            self.last_physical_outcome = physical_outcome
+            raise provider_error
+
+    entity = lock_module.UfanetDoorLock(coordinator, Client(), target)
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await entity.async_open()
+
+    assert str(raised.value) == message
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "private" not in str(raised.value)
+    assert entity.extra_state_attributes == attributes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("later_error", "later_outcome", "message"),
+    [
+        (
+            UfanetConcurrentOpenError("private concurrent detail"),
+            None,
+            "Another door command is already in progress",
+        ),
+        (
+            UfanetOpenError("private cooldown detail"),
+            "unknown",
+            "Door opening was not confirmed",
+        ),
+        (
+            UfanetOpenError("private preflight detail"),
+            None,
+            "Door opening was not confirmed",
+        ),
+    ],
+)
+async def test_pretransmission_rejection_preserves_prior_unknown_warning(
+    later_error: BaseException,
+    later_outcome: str | None,
+    message: str,
+) -> None:
+    target = door("a")
+    coordinator = coordinator_snapshot({target.key: target})
+
+    class Client:
+        def __init__(self) -> None:
+            self.last_physical_outcome: str | None = None
+            self.attempt = 0
+
+        async def async_open(self, _key: str) -> None:
+            self.attempt += 1
+            if self.attempt == 1:
+                self.last_physical_outcome = "unknown"
+                raise UfanetOpenUnknownOutcome("private initial detail")
+            self.last_physical_outcome = later_outcome
+            raise later_error
+
+    entity = lock_module.UfanetDoorLock(coordinator, Client(), target)
+    with pytest.raises(HomeAssistantError):
+        await entity.async_open()
+    writes_after_unknown = entity.state_writes
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await entity.async_open()
+
+    assert str(raised.value) == message
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert entity.extra_state_attributes == {
+        "last_command_outcome": "unknown",
+        "do_not_retry": True,
+    }
+    assert entity.state_writes == writes_after_unknown
+
+
+@pytest.mark.asyncio
+async def test_transmitted_not_confirmed_replaces_prior_unknown_warning() -> None:
+    target = door("a")
+    coordinator = coordinator_snapshot({target.key: target})
+
+    class Client:
+        def __init__(self) -> None:
+            self.last_physical_outcome: str | None = None
+            self.attempt = 0
+
+        async def async_open(self, _key: str) -> None:
+            self.attempt += 1
+            if self.attempt == 1:
+                self.last_physical_outcome = "unknown"
+                raise UfanetOpenUnknownOutcome("private initial detail")
+            self.last_physical_outcome = "not_confirmed"
+            raise UfanetOpenError("private current detail")
+
+    entity = lock_module.UfanetDoorLock(coordinator, Client(), target)
+    with pytest.raises(HomeAssistantError):
+        await entity.async_open()
+
+    with pytest.raises(
+        HomeAssistantError, match="^Door opening was not confirmed$"
+    ) as raised:
+        await entity.async_open()
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert entity.extra_state_attributes == {
+        "last_command_outcome": "not_confirmed",
+        "do_not_retry": False,
+    }
+    assert entity.state_writes == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_entities_keep_task_local_physical_outcomes() -> None:
+    target_a = door("a")
+    target_b = door("b", shared_id=1002)
+    coordinator = coordinator_snapshot({target_a.key: target_a, target_b.key: target_b})
+    b_transmitted = asyncio.Event()
+    release_b = asyncio.Event()
+
+    class Client:
+        def __init__(self) -> None:
+            self._outcome: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+                "synthetic_physical_outcome", default=None
+            )
+            self.a_attempts = 0
+
+        @property
+        def last_physical_outcome(self) -> str | None:
+            return self._outcome.get()
+
+        async def async_open(self, key: str) -> None:
+            self._outcome.set(None)
+            if key == target_a.key:
+                self.a_attempts += 1
+                if self.a_attempts == 1:
+                    self._outcome.set("unknown")
+                    raise UfanetOpenUnknownOutcome("private initial detail")
+                raise UfanetOpenError("private pre-send detail")
+
+            self._outcome.set("unknown")
+            self._outcome.set("not_confirmed")
+            b_transmitted.set()
+            await release_b.wait()
+            raise UfanetOpenError("private not-confirmed detail")
+
+    client = Client()
+    entity_a = lock_module.UfanetDoorLock(coordinator, client, target_a)
+    entity_b = lock_module.UfanetDoorLock(coordinator, client, target_b)
+
+    with pytest.raises(HomeAssistantError):
+        await entity_a.async_open()
+    assert entity_a.extra_state_attributes == {
+        "last_command_outcome": "unknown",
+        "do_not_retry": True,
+    }
+    writes_after_unknown = entity_a.state_writes
+
+    opening_b = asyncio.create_task(entity_b.async_open())
+    await asyncio.wait_for(b_transmitted.wait(), timeout=1)
+    with pytest.raises(HomeAssistantError, match="^Door opening was not confirmed$"):
+        await entity_a.async_open()
+
+    assert entity_a.extra_state_attributes == {
+        "last_command_outcome": "unknown",
+        "do_not_retry": True,
+    }
+    assert entity_a.state_writes == writes_after_unknown
+
+    release_b.set()
+    with pytest.raises(HomeAssistantError, match="^Door opening was not confirmed$"):
+        await opening_b
+    assert entity_b.extra_state_attributes == {
+        "last_command_outcome": "not_confirmed",
+        "do_not_retry": False,
+    }
+
+
+class LifecycleClient:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def begin_close(self) -> None:
+        self.events.append("begin")
+
+    def cancel_close(self) -> None:
+        self.events.append("cancel")
+
+    async def async_drain(self) -> None:
+        self.events.append("drain")
+
+
+class LifecycleSession:
+    def __init__(self, name: str, events: list[str]) -> None:
+        self.name = name
+        self.events = events
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+        self.events.append(self.name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unload_result", [True, False])
+async def test_unload_lifecycle_retains_sessions_only_on_failure(
+    unload_result: bool,
+) -> None:
+    config_entries = FakeConfigEntries(unload_result=unload_result)
+    events = config_entries.events
+    client = LifecycleClient(events)
+    read_session = LifecycleSession("read-close", events)
+    open_session = LifecycleSession("open-close", events)
+    entry = SimpleNamespace(
+        runtime_data=SimpleNamespace(
+            client=client,
+            read_session=read_session,
+            open_session=open_session,
+        )
+    )
+    hass = SimpleNamespace(config_entries=config_entries)
+
+    assert await runtime_module.async_unload_entry(hass, entry) is unload_result
+    if unload_result:
+        assert events[:3] == ["begin", "unload", "drain"]
+        assert set(events[3:]) == {"read-close", "open-close"}
+        assert read_session.closed and open_session.closed
+    else:
+        assert events == ["begin", "unload", "cancel"]
+        assert not read_session.closed and not open_session.closed
+
+
+@pytest.mark.asyncio
+async def test_repeatedly_cancelled_unload_finishes_drain_and_propagates_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_entries = FakeConfigEntries()
+    events = config_entries.events
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    first_cancel_seen = asyncio.Event()
+    second_cancel_seen = asyncio.Event()
+    cancellations: list[asyncio.CancelledError] = []
+    real_shield = asyncio.shield
+
+    async def recording_shield(awaitable: Any) -> Any:
+        try:
+            return await real_shield(awaitable)
+        except asyncio.CancelledError as error:
+            cancellations.append(error)
+            (first_cancel_seen if len(cancellations) == 1 else second_cancel_seen).set()
+            raise
+
+    monkeypatch.setattr(runtime_module.asyncio, "shield", recording_shield)
+
+    class BlockingClient(LifecycleClient):
+        async def async_drain(self) -> None:
+            self.events.append("drain-start")
+            drain_started.set()
+            await release_drain.wait()
+            self.events.append("drain-complete")
+
+    client = BlockingClient(events)
+    read_session = LifecycleSession("read-close", events)
+    open_session = LifecycleSession("open-close", events)
+    entry = SimpleNamespace(
+        runtime_data=SimpleNamespace(
+            client=client,
+            read_session=read_session,
+            open_session=open_session,
+        )
+    )
+    hass = SimpleNamespace(config_entries=config_entries)
+
+    unloading = asyncio.create_task(runtime_module.async_unload_entry(hass, entry))
+    await asyncio.wait_for(drain_started.wait(), timeout=1)
+    unloading.cancel("first synthetic unload cancellation")
+    await asyncio.wait_for(first_cancel_seen.wait(), timeout=1)
+    unloading.cancel("second synthetic unload cancellation")
+    await asyncio.wait_for(second_cancel_seen.wait(), timeout=1)
+
+    assert not unloading.done()
+    assert not read_session.closed
+    assert not open_session.closed
+    assert events == ["begin", "unload", "drain-start"]
+
+    release_drain.set()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await unloading
+
+    assert len(cancellations) == 2
+    assert cancellations[0].args == ("first synthetic unload cancellation",)
+    assert cancellations[1].args == ("second synthetic unload cancellation",)
+    assert raised.value is cancellations[0]
+    assert raised.value.args == ("first synthetic unload cancellation",)
+    assert events[:4] == ["begin", "unload", "drain-start", "drain-complete"]
+    assert set(events[4:]) == {"read-close", "open-close"}
+    assert read_session.closed and open_session.closed
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_are_aggregate_only_and_private() -> None:
+    doors = {
+        "a" * 64: door("a"),
+        "b" * 64: door("b", openable=False, shared_id=1002),
+        "c" * 64: door("c", trusted=False, shared_id=1003),
+    }
+    entry = SimpleNamespace(
+        title="private title",
+        data=config_data(**{CONF_REQUIRES_ACK: True}),
+        runtime_data=SimpleNamespace(
+            coordinator=SimpleNamespace(data=doors, last_update_success=True)
+        ),
+    )
+    result = await diagnostics_module.async_get_config_entry_diagnostics(None, entry)
+
+    assert result == {
+        "last_update_success": True,
+        "requires_ack": True,
+        "discovered_count": 3,
+        "trusted_count": 2,
+        "openable_trusted_count": 1,
+    }
+    rendered = repr(result)
+    for private in (
+        entry.title,
+        entry.data[CONF_CONTRACT],
+        entry.data[CONF_PASSWORD],
+        entry.data[CONF_IDENTITY_KEY],
+        "a" * 64,
+        "Provider display",
+    ):
+        assert private not in rendered
+
+
+def forbid_migration_runtime_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Fail immediately if a local migration reaches any runtime boundary."""
+
+    effects: list[str] = []
+
+    def forbidden(name: str) -> Any:
+        def record(*_args: Any, **_kwargs: Any) -> Any:
+            effects.append(name)
+            raise AssertionError(f"migration called {name}")
+
+        return record
+
+    monkeypatch.setattr(runtime_module, "_new_session", forbidden("session"))
+    monkeypatch.setattr(runtime_module, "UfanetClient", forbidden("client"))
+    monkeypatch.setattr(runtime_module, "UfanetCoordinator", forbidden("discovery"))
+    return effects
+
+
+@pytest.mark.asyncio
+async def test_v1_migration_preserves_data_and_updates_to_safe_v2_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effects = forbid_migration_runtime_work(monkeypatch)
+    generated_key = bytes(range(32))
+    generation_sizes: list[int] = []
+
+    def generate_identity_key(size: int) -> bytes:
+        generation_sizes.append(size)
+        return generated_key
+
+    monkeypatch.setattr(runtime_module.secrets, "token_bytes", generate_identity_key)
+    original_data = {
+        CONF_CONTRACT: "SYNTHETIC",
+        CONF_PASSWORD: "password",
+        "private_future_setting": {"preserve": [1, 2, 3]},
+        CONF_IDENTITY_KEY: "legacy-value",
+        CONF_TRUSTED_BINDINGS: {"legacy": "must-not-be-trusted"},
+        CONF_REQUIRES_ACK: False,
+    }
+    config_entries = FakeConfigEntries()
+    hass = SimpleNamespace(config_entries=config_entries)
+    entry = ConfigEntry(version=1, data=original_data.copy())
+
+    assert await runtime_module.async_migrate_entry(hass, entry) is True
+    assert len(config_entries.update_calls) == 1
+    updated_entry, updates = config_entries.update_calls[0]
+    assert updated_entry is entry
+    assert updates["version"] == 2
+    data = updates["data"]
+    assert data[CONF_CONTRACT] == original_data[CONF_CONTRACT]
+    assert data[CONF_PASSWORD] == original_data[CONF_PASSWORD]
+    assert data["private_future_setting"] == original_data["private_future_setting"]
+    assert data[CONF_IDENTITY_KEY] == ENCODED_IDENTITY_KEY
+    assert runtime_module._decode_identity_key(data[CONF_IDENTITY_KEY]) == generated_key
+    assert data[CONF_TRUSTED_BINDINGS] == {}
+    assert data[CONF_REQUIRES_ACK] is True
+    assert type(data[CONF_REQUIRES_ACK]) is bool
+    assert set(data) == set(original_data)
+    assert original_data[CONF_IDENTITY_KEY] == "legacy-value"
+    assert original_data[CONF_TRUSTED_BINDINGS] == {"legacy": "must-not-be-trusted"}
+    assert original_data[CONF_REQUIRES_ACK] is False
+    assert generation_sizes == [32]
+    assert effects == []
+
+    assert await runtime_module.async_migrate_entry(hass, entry) is True
+    assert len(config_entries.update_calls) == 1
+    assert generation_sizes == [32]
+    assert effects == []
+
+
+@pytest.mark.asyncio
+async def test_v2_migration_is_idempotent_and_does_not_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    effects = forbid_migration_runtime_work(monkeypatch)
+
+    def forbidden_generation(_size: int) -> bytes:
+        raise AssertionError("idempotent migration generated an identity key")
+
+    monkeypatch.setattr(runtime_module.secrets, "token_bytes", forbidden_generation)
+    config_entries = FakeConfigEntries()
+    hass = SimpleNamespace(config_entries=config_entries)
+    original_data = config_data(private_future_setting={"preserve": True})
+    entry = ConfigEntry(version=2, data=original_data.copy())
+
+    assert await runtime_module.async_migrate_entry(hass, entry) is True
+    assert config_entries.update_calls == []
+    assert entry.data == original_data
+    assert effects == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version",
+    [True, False, "2", None, 0, -1, 3, 999],
+    ids=["true", "false", "string", "none", "zero", "negative", "future", "far-future"],
+)
+async def test_migration_rejects_malformed_and_future_versions_without_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    version: object,
+) -> None:
+    effects = forbid_migration_runtime_work(monkeypatch)
+    generation_sizes: list[int] = []
+
+    def forbidden_generation(size: int) -> bytes:
+        generation_sizes.append(size)
+        raise AssertionError("invalid migration generated an identity key")
+
+    monkeypatch.setattr(runtime_module.secrets, "token_bytes", forbidden_generation)
+    config_entries = FakeConfigEntries()
+    hass = SimpleNamespace(config_entries=config_entries)
+    original_data = config_data(private_future_setting={"preserve": True})
+    entry = ConfigEntry(version=1, data=original_data.copy())
+    entry.version = version
+
+    assert await runtime_module.async_migrate_entry(hass, entry) is False
+    assert config_entries.update_calls == []
+    assert entry.data == original_data
+    assert entry.version is version
+    assert generation_sizes == []
+    assert effects == []

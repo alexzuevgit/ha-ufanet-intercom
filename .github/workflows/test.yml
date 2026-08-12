@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.11.13"
+          python-version: "3.13.5"
+          checksum: "f830ea3d38ae1492acf53cb7f2cd0f81d6ae22b42d2d7310a6c7d42c451e1a43"
+          enable-cache: true
+
+      - name: Sync development dependencies
+        run: uv sync --locked --dev
+
+      - name: Ruff check
+        run: uv run ruff check . --isolated --select E4,E7,E9,F
+
+      - name: Ruff format check
+        run: uv run ruff format --check . --isolated
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Validate Python and JSON files
+        run: |
+          uv run python -m compileall -q custom_components tests
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+
+          for path in sorted(Path(".").rglob("*.json")):
+              with path.open(encoding="utf-8") as file:
+                  json.load(file)
+          PY

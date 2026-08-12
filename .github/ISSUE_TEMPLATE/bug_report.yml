@@ -1,0 +1,90 @@
+name: Bug report
+description: Report a reproducible, sanitized integration problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Ufanet Intercom.
+        Do not include credentials, passwords, tokens, contract or login values, provider IDs, addresses, camera data, or raw diagnostics. Report physical-access vulnerabilities privately through GitHub Security Advisories.
+
+  - type: input
+    id: home_assistant_version
+    attributes:
+      label: Home Assistant version
+      description: Enter the complete Home Assistant version.
+      placeholder: "2026.x.y"
+    validations:
+      required: true
+
+  - type: input
+    id: integration_version
+    attributes:
+      label: Integration version
+      description: Enter the installed Ufanet Intercom version.
+      placeholder: "x.y.z"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation_method
+    attributes:
+      label: Installation method
+      options:
+        - HACS custom repository
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Sanitized reproduction steps
+      description: Describe the smallest sanitized sequence that reproduces the problem. Replace all private values with generic labels.
+      placeholder: |
+        1. Add the integration.
+        2. Perform the standard action.
+        3. Observe the error.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Use only sanitized text.
+    validations:
+      required: true
+
+  - type: textarea
+    id: sanitized_logs
+    attributes:
+      label: Sanitized logs
+      description: Optional. Include only the smallest relevant excerpt after removing all sensitive data. Never attach raw diagnostics.
+      render: text
+
+  - type: checkboxes
+    id: privacy_confirmation
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I confirm this issue does not contain sensitive identifiers, credentials, tokens, contract or login values, provider IDs, addresses, camera data, or raw diagnostics.
+          required: true
+
+  - type: checkboxes
+    id: security_confirmation
+    attributes:
+      label: Security confirmation
+      options:
+        - label: I confirm this report does not describe a physical-access vulnerability; such vulnerabilities must be reported privately through GitHub Security Advisories.
+          required: true

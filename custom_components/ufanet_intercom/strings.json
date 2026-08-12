@@ -1,0 +1,67 @@
+{
+  "title": "Ufanet Intercom",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect Ufanet intercom",
+        "description": "Enter the account credentials to perform read-only discovery. No entrance is opened during setup.",
+        "data": {
+          "contract": "Contract",
+          "password": "Password"
+        }
+      },
+      "acknowledge": {
+        "title": "Acknowledge discovered entrances",
+        "description": "Read-only discovery found {discovered_count} entrances, {distinct_name_count} distinct names, and {duplicate_name_count} duplicate names. Before creating the entry, understand that calling lock.open causes real physical actuation and opens an entrance; exposing this lock to a remote UI, automations, or a voice assistant can also actuate it. Provider-supplied display names may be address-like and can persist in the entity registry, device registry, backups, Recorder/history, remote UI, and voice-assistant metadata. Duplicate names require careful identification. Confirm to trust all discovered bindings.",
+        "data": {
+          "acknowledge": "I acknowledge and trust all discovered entrance bindings"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Ufanet intercom",
+        "description": "Enter the current Ufanet password. No entrance is opened during reauthentication.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to Ufanet.",
+      "invalid_auth": "Authentication failed.",
+      "invalid_targets": "The discovered entrances could not be validated.",
+      "unknown": "Unexpected validation failure."
+    },
+    "abort": {
+      "already_configured": "This Ufanet account is already configured.",
+      "already_in_progress": "Setup for this Ufanet account is already in progress.",
+      "reauth_successful": "Reauthentication succeeded.",
+      "unknown": "The setup candidate is no longer available."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Check entrance bindings",
+        "description": "Perform read-only discovery to check for bindings that require acknowledgement.",
+        "data": {}
+      },
+      "adopt": {
+        "title": "Acknowledge pending bindings",
+        "description": "Discovery found {pending_count} pending bindings: {new_count} new and {changed_count} changed. Confirm to trust all pending bindings.",
+        "data": {
+          "acknowledge": "I acknowledge and trust all pending entrance bindings"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to Ufanet.",
+      "invalid_auth": "Authentication failed.",
+      "invalid_targets": "The discovered entrances could not be validated.",
+      "unknown": "Unexpected validation failure."
+    },
+    "abort": {
+      "no_pending_targets": "No entrance bindings require acknowledgement.",
+      "adoption_successful": "The pending entrance bindings were trusted."
+    }
+  }
+}
