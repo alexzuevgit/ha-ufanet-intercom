@@ -4,7 +4,7 @@
 
 > **Важно:** это независимый community-проект. Он не связан с Ufanet, не одобрен компанией и не поддерживается её службой поддержки.
 
-> **Версия 2.0.0rc1 — release candidate.** Она предназначена для контролируемой установки с резервной копией и проверкой обнаруженных входов перед созданием автоматизаций. После сетевой ошибки или неизвестного результата не повторяйте открытие вручную как диагностический тест. Пошаговый порядок внедрения и возврата: [Controlled rollout and rollback](docs/controlled-rollout-and-rollback.md).
+> **Версия 2.0.0rc2 — release candidate.** Она предназначена для контролируемой установки с резервной копией и проверкой обнаруженных входов перед созданием автоматизаций. После сетевой ошибки или неизвестного результата не повторяйте открытие вручную как диагностический тест. Пошаговый порядок внедрения и возврата: [Controlled rollout and rollback](docs/controlled-rollout-and-rollback.md).
 
 ## Русский
 
@@ -45,15 +45,15 @@
 1. Откройте HACS и раздел **Integrations**.
 2. Откройте меню пользовательских репозиториев и введите **GitHub URL этого репозитория**.
 3. Выберите категорию **Integration** и добавьте репозиторий.
-4. В меню репозитория включите **Show beta versions**, затем выберите **Need a different version?** и установите точный тег **v2.0.0rc1**. Не устанавливайте RC с ветки по умолчанию.
-5. Перезапустите Home Assistant и до настройки или физической проверки убедитесь в HACS, что установленная версия — именно **2.0.0rc1**.
+4. В меню репозитория включите **Show beta versions**, затем выберите **Need a different version?** и установите точный тег **v2.0.0rc2**. Не устанавливайте RC с ветки по умолчанию.
+5. Перезапустите Home Assistant и до настройки или физической проверки убедитесь в HACS, что установленная версия — именно **2.0.0rc2**.
 6. Откройте **Настройки → Устройства и службы → Добавить интеграцию**, выберите **Ufanet Intercom** и введите договор (логин) и пароль.
 
 ## English
 
 Ufanet Intercom is an unofficial community integration for Home Assistant. It is not affiliated with, endorsed by, or supported by Ufanet.
 
-> **Version 2.0.0rc1 is a release candidate.** Install it only through a controlled rollout with a backup, and review every discovered entrance before creating automations. After a network error or unknown outcome, do not retry opening as a diagnostic action. Follow [Controlled rollout and rollback](docs/controlled-rollout-and-rollback.md).
+> **Version 2.0.0rc2 is a release candidate.** Install it only through a controlled rollout with a backup, and review every discovered entrance before creating automations. After a network error or unknown outcome, do not retry opening as a diagnostic action. Follow [Controlled rollout and rollback](docs/controlled-rollout-and-rollback.md).
 
 ### Behavior and scope
 
@@ -77,8 +77,8 @@ If Home Assistant is remotely accessible or connected to a voice assistant, rest
 
 1. Open **HACS → Integrations → Custom repositories**.
 2. Enter **this repository's GitHub URL** and select **Integration**.
-3. Add the repository. In its menu, enable **Show beta versions**, select **Need a different version?**, and install the exact **v2.0.0rc1** tag. Do not install the RC from the mutable default branch.
-4. Restart Home Assistant and verify the installed version in HACS is exactly **2.0.0rc1** before configuration or any physical test.
+3. Add the repository. In its menu, enable **Show beta versions**, select **Need a different version?**, and install the exact **v2.0.0rc2** tag. Do not install the RC from the mutable default branch.
+4. Restart Home Assistant and verify the installed version in HACS is exactly **2.0.0rc2** before configuration or any physical test.
 5. Add **Ufanet Intercom** from **Settings → Devices & services** and enter the contract/login and password.
 
 ## Development checks

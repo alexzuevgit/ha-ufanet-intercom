@@ -305,7 +305,7 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
         "iot_class": "cloud_polling",
         "issue_tracker": "https://github.com/alexzuevgit/ha-ufanet-intercom/issues",
         "requirements": [],
-        "version": "2.0.0rc1",
+        "version": "2.0.0rc2",
     }
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -325,7 +325,7 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
     assert root_packages[0]["version"] == manifest["version"]
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "2.0.0rc1" in readme
+    assert "2.0.0rc2" in readme
     assert "release candidate" in readme.casefold()
 
 
@@ -411,6 +411,7 @@ def test_component_surface_is_dynamic_lock_only_and_importable() -> None:
         "diagnostics.py",
         "lock.py",
         "manifest.json",
+        "brand/icon.png",
         "strings.json",
         "translations/en.json",
         "translations/ru.json",

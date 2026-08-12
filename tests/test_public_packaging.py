@@ -118,7 +118,7 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
     assert "резервные копии Home Assistant" in text
     assert "Home Assistant backups" in text
     assert "voice assistant" in text
-    assert "2.0.0rc1" in text
+    assert "2.0.0rc2" in text
     assert "release candidate" in text.casefold()
     assert text.count("python tests/ha_entity_registry_probe.py") == 2
     assert "docs/controlled-rollout-and-rollback.md" in text
@@ -127,7 +127,7 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
     assert "uv run ruff format --check ." in text
     assert "Show beta versions" in text
     assert "Need a different version?" in text
-    assert "v2.0.0rc1" in text
+    assert "v2.0.0rc2" in text
     assert "verify the installed version" in text.casefold()
 
     rollout = _read_utf8(ROOT / "docs" / "controlled-rollout-and-rollback.md")
@@ -137,7 +137,7 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
         "do not retry",
         "at most one explicitly authorized manual",
         "Show beta versions",
-        "v2.0.0rc1",
+        "v2.0.0rc2",
         "verify the installed version",
         "Preferred rollback",
         "restore the complete backup",
@@ -146,7 +146,12 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
 
 
 def test_brand_icon_is_a_complete_256_pixel_png() -> None:
-    data = (ROOT / "brand" / "icon.png").read_bytes()
+    root_icon = (ROOT / "brand" / "icon.png").read_bytes()
+    component_icon = (
+        ROOT / "custom_components" / "ufanet_intercom" / "brand" / "icon.png"
+    ).read_bytes()
+    assert root_icon == component_icon
+    data = component_icon
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
 
     chunks: list[tuple[bytes, bytes]] = []

@@ -1,6 +1,6 @@
 # Controlled rollout and rollback
 
-This guide applies to the `2.0.0rc1` release candidate. The integration can perform a real physical opening through Home Assistant. Treat every `lock.open` call as a physical-access action.
+This guide applies to the `2.0.0rc2` release candidate. The integration can perform a real physical opening through Home Assistant. Treat every `lock.open` call as a physical-access action.
 
 ## Before installation
 
@@ -12,9 +12,9 @@ This guide applies to the `2.0.0rc1` release candidate. The integration can perf
 
 ## Controlled installation
 
-1. After publication, add the HACS Custom repository, enable **Show beta versions**, select **Need a different version?**, and install the exact **v2.0.0rc1** tag. Do not install this RC from the mutable default branch. Alternatively, copy only the packaged `ufanet_intercom` directory into `custom_components` while Home Assistant is stopped.
+1. After publication, add the HACS Custom repository, enable **Show beta versions**, select **Need a different version?**, and install the exact **v2.0.0rc2** tag. Do not install this RC from the mutable default branch. Alternatively, copy only the packaged `ufanet_intercom` directory into `custom_components` while Home Assistant is stopped.
 2. Start Home Assistant and inspect the log before configuring the integration. Stop if import, migration, authentication, or config-entry errors appear.
-3. Verify the installed version is exactly **2.0.0rc1** before configuration or any physical test. Then add or migrate the integration through the UI. Setup and reauthentication perform authentication and read-only inventory discovery; they must not open an entrance.
+3. Verify the installed version is exactly **2.0.0rc2** before configuration or any physical test. Then add or migrate the integration through the UI. Setup and reauthentication perform authentication and read-only inventory discovery; they must not open an entrance.
 4. Review the aggregate number of discovered entrances and the physical-access/privacy warning before acknowledging the initial bindings.
 5. Verify that every expected entrance has exactly one Device and one Lock entity, that unexpected/blocked/changed targets are unavailable, and that no unrelated device family was exposed.
 6. Keep all automations disabled. Perform at most one explicitly authorized manual `lock.open` test for one exact entrance while an operator observes the physical result.
