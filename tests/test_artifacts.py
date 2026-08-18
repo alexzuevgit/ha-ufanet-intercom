@@ -7,10 +7,11 @@ import json
 import re
 import subprocess
 import sys
-import tomllib
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+
+import tomllib
 
 import custom_components.ufanet_intercom.const as const_module
 from custom_components.ufanet_intercom.const import (
@@ -153,7 +154,8 @@ def test_identities_are_full_keyed_hmacs_for_synthetic_values() -> None:
 
 
 def test_dynamic_door_contract_has_no_static_table_or_url_field() -> None:
-    assert PLATFORMS == ("lock",)
+    assert PLATFORMS == ("button", "binary_sensor", "camera")
+    assert not hasattr(const_module, "CAMERA_LINKS")
     assert not hasattr(const_module, "TARGETS")
     assert not hasattr(const_module, "TARGET_CONFIGS")
     assert not hasattr(const_module, "CONF_URL")
@@ -170,6 +172,8 @@ def test_dynamic_door_contract_has_no_static_table_or_url_field() -> None:
         "binding",
         "openable",
         "trusted",
+        "cctv_number",
+        "house",
     }
     assert door_fields.isdisjoint({"url", "base_url", "open_url", "open_path"})
 
@@ -230,7 +234,6 @@ def test_sanitized_shared_inventory_fixture_is_fully_synthetic() -> None:
         "frsi",
         "is_blocked",
         "is_fav",
-        "is_support_sip_monitor",
         "no_sound",
         "supports_key_recording",
     }
@@ -304,8 +307,8 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
         "integration_type": "hub",
         "iot_class": "cloud_polling",
         "issue_tracker": "https://github.com/alexzuevgit/ha-ufanet-intercom/issues",
-        "requirements": [],
-        "version": "2.0.0rc2",
+        "requirements": ["httpx==0.28.1"],
+        "version": "2.0.0rc6",
     }
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -325,7 +328,7 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
     assert root_packages[0]["version"] == manifest["version"]
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "2.0.0rc2" in readme
+    assert "2.0.0rc6" in readme
     assert "release candidate" in readme.casefold()
 
 
@@ -368,7 +371,7 @@ def test_strings_and_translations_cover_complete_v2_flows() -> None:
     _assert_concepts(
         english_warning,
         {
-            "explicit standard action": ("lock.open",),
+            "explicit standard action": ("button.press",),
             "physical actuation": ("physical actuation", "physically open"),
             "remote access": ("remote ui", "remote user interface"),
             "automations": ("automation",),
@@ -385,7 +388,7 @@ def test_strings_and_translations_cover_complete_v2_flows() -> None:
     _assert_concepts(
         russian_warning,
         {
-            "стандартное действие": ("lock.open",),
+            "стандартное действие": ("button.press",),
             "физическое срабатывание": ("физическ",),
             "удалённый доступ": ("удалённ",),
             "автоматизации": ("автоматизац",),
@@ -401,7 +404,7 @@ def test_strings_and_translations_cover_complete_v2_flows() -> None:
     )
 
 
-def test_component_surface_is_dynamic_lock_only_and_importable() -> None:
+def test_component_surface_is_dynamic_button_and_call_sensor_importable() -> None:
     expected = {
         "__init__.py",
         "api.py",
@@ -409,7 +412,12 @@ def test_component_surface_is_dynamic_lock_only_and_importable() -> None:
         "const.py",
         "coordinator.py",
         "diagnostics.py",
-        "lock.py",
+        "button.py",
+        "binary_sensor.py",
+        "history.py",
+        "camera.py",
+        "media.py",
+        "rtsp_proxy.py",
         "manifest.json",
         "brand/icon.png",
         "strings.json",
@@ -423,16 +431,15 @@ def test_component_surface_is_dynamic_lock_only_and_importable() -> None:
     }
     assert existing == expected
 
-    lock_tree = _python_tree("lock.py")
+    button_tree = _python_tree("button.py")
     imports = {
         node.module
-        for node in ast.walk(lock_tree)
+        for node in ast.walk(button_tree)
         if isinstance(node, ast.ImportFrom) and node.module is not None
     }
-    assert "homeassistant.components.lock" in imports
-    assert all("button" not in module for module in imports)
-    assert "async_open" in _function_names(lock_tree)
-    assert _function_names(lock_tree).isdisjoint({"async_lock", "async_unlock"})
+    assert "homeassistant.components.button" in imports
+    assert "homeassistant.components.lock" not in imports
+    assert "async_press" in _function_names(button_tree)
 
     all_python = [_python_tree(path.name) for path in COMPONENT.glob("*.py")]
     all_functions = set().union(*(_function_names(tree) for tree in all_python))
@@ -440,7 +447,7 @@ def test_component_surface_is_dynamic_lock_only_and_importable() -> None:
         {"async_register_service", "async_setup_services", "async_unlock"}
     )
     assert "services.yaml" not in existing
-    assert "button.py" not in existing
+    assert "lock.py" not in existing
 
     result = subprocess.run(
         [sys.executable, str(ROOT / "tests" / "ha_stub_import.py")],
@@ -476,7 +483,16 @@ def test_runtime_artifact_declares_two_safe_transports_ack_gate_and_migration() 
         if isinstance(statement, ast.AnnAssign)
         and isinstance(statement.target, ast.Name)
     }
-    assert runtime_fields == {"client", "coordinator", "read_session", "open_session"}
+    assert runtime_fields == {
+        "client",
+        "coordinator",
+        "read_session",
+        "open_session",
+        "history_manager",
+        "history_poller",
+        "rtsp_proxy",
+        "proxy_unsubscribe",
+    }
 
     setup = next(
         node

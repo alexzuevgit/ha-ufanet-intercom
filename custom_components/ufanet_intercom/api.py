@@ -35,6 +35,13 @@ from .const import (
     discovered_door_binding,
     discovered_door_key,
 )
+from .history import (
+    HISTORY_PATH,
+    MAX_HISTORY_RESPONSE_BYTES,
+    CallHistoryPage,
+    HistoryProtocolError,
+    parse_call_history,
+)
 
 MAX_AUTH_RESPONSE_BYTES: Final = 32 * 1024
 MAX_DISCOVERY_RESPONSE_BYTES: Final = 256 * 1024
@@ -245,7 +252,7 @@ def _parse_tokens(payload: Any, *, nested: bool) -> tuple[str, str, int]:
 
 
 def _display_name(item: Mapping[str, Any]) -> str:
-    for field_name in ("custom_name", "string_view"):
+    for field_name in ("custom_name", "string_view", "address"):
         value = item.get(field_name)
         if type(value) is str and len(value) <= MAX_DISPLAY_NAME_CHARS:
             stripped = value.strip()
@@ -726,11 +733,75 @@ class UfanetClient:
                     not disable_button and not is_blocked and bool(cctv_number.strip())
                 ),
                 trusted=trusted,
+                cctv_number=cctv_number,
+                house=house,
             )
 
         if not discovered:
             raise _discovery_failure()
         return MappingProxyType(discovered)
+
+    async def async_call_history(self) -> CallHistoryPage:
+        """Fetch one bounded first page through the read-only JWT session."""
+
+        try:
+            async with self._operation_lock:
+                await self._ensure_auth_locked()
+                try:
+                    return await self._history_once_locked()
+                except _InventoryUnauthorized:
+                    await self._refresh_locked()
+                    try:
+                        return await self._history_once_locked()
+                    except _InventoryUnauthorized:
+                        raise UfanetAuthenticationError(
+                            "Authentication failed."
+                        ) from None
+        except asyncio.CancelledError as error:
+            _sanitize_cancellation(error)
+            raise
+        except (UfanetError, HistoryProtocolError) as error:
+            _detach_exception_context(error)
+            raise
+
+    async def _history_once_locked(self) -> CallHistoryPage:
+        self._require_read_transport_safe()
+        token = self._access_token
+        if token is None:
+            raise UfanetAuthenticationError("Authentication required.")
+        response: _Response | None = None
+        try:
+            try:
+                response = await self._session.get(
+                    f"{BASE_URL}{HISTORY_PATH}",
+                    headers={
+                        "Authorization": f"JWT {token}",
+                        "Accept": _JSON_CONTENT_TYPE,
+                        "User-Agent": USER_AGENT,
+                    },
+                    allow_redirects=False,
+                    timeout=_READ_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                raise UfanetConnectionError("Unable to contact Ufanet.") from None
+            if response.status in (401, 403):
+                raise _InventoryUnauthorized
+            if response.status != 200:
+                raise UfanetConnectionError("Unable to contact Ufanet.")
+            payload = await _read_bounded_json(
+                response,
+                MAX_HISTORY_RESPONSE_BYTES,
+                lambda: UfanetProtocolError("Invalid call history response."),
+            )
+            try:
+                return parse_call_history(payload)
+            except HistoryProtocolError:
+                raise UfanetProtocolError("Invalid call history response.") from None
+        finally:
+            if response is not None:
+                _safe_release(response)
 
     def _open_transport_is_safe(self) -> bool:
         open_session = self._open_session

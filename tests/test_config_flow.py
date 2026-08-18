@@ -5,9 +5,10 @@ never instantiate the real client and make every session request method fail.
 """
 
 # Imports must follow the dynamic sys.modules/sys.path Home Assistant stub bootstrap.
-# ruff: noqa: E402
 
 from __future__ import annotations
+
+# ruff: noqa: E402
 
 import asyncio
 import base64
@@ -482,7 +483,7 @@ def test_initial_acknowledgement_describes_actuation_and_name_risks() -> None:
     assert_semantic_concepts(
         english,
         {
-            "lock.open service call": ("lock.open",),
+            "button.press service call": ("button.press",),
             "real physical actuation": ("physical actuation", "physically open"),
             "remote UI exposure": ("remote ui", "remote user interface"),
             "automation exposure": ("automation",),
@@ -514,7 +515,7 @@ def test_initial_acknowledgement_describes_actuation_and_name_risks() -> None:
     assert_semantic_concepts(
         russian,
         {
-            "вызов службы lock.open": ("lock.open",),
+            "вызов службы button.press": ("button.press",),
             "реальное физическое срабатывание": ("физическ",),
             "удалённый интерфейс": ("удалённ",),
             "автоматизации": ("автоматизац",),

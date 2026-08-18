@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
 
 PACKAGE_NAME = "custom_components.ufanet_intercom"
 if PACKAGE_NAME not in sys.modules:

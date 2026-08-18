@@ -25,6 +25,9 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import UfanetCoordinator
+from .history import CallHistoryManager, CallHistoryPoller
+from .media import CameraBinding, GatewayError, MediaCredentials, UfanetMediaClient
+from .rtsp_proxy import RtspProxyRuntime
 
 
 @dataclass(slots=True)
@@ -35,6 +38,10 @@ class UfanetRuntimeData:
     coordinator: UfanetCoordinator
     read_session: ClientSession
     open_session: ClientSession
+    history_manager: CallHistoryManager
+    history_poller: CallHistoryPoller
+    rtsp_proxy: RtspProxyRuntime
+    proxy_unsubscribe: Any | None = None
 
 
 type UfanetConfigEntry = ConfigEntry[UfanetRuntimeData]
@@ -119,12 +126,99 @@ async def _async_close_sessions(*sessions: ClientSession | None) -> None:
 
 
 async def _async_drain_and_close(runtime: UfanetRuntimeData) -> None:
-    """Finish active operations before closing their isolated transports."""
+    """Stop the account history poller before closing isolated transports."""
 
     try:
+        history_poller = getattr(runtime, "history_poller", None)
+        if history_poller is not None:
+            await history_poller.async_stop()
         await runtime.client.async_drain()
     finally:
+        unsubscribe = getattr(runtime, "proxy_unsubscribe", None)
+        if callable(unsubscribe):
+            unsubscribe()
+        proxy = getattr(runtime, "rtsp_proxy", None)
+        if proxy is not None:
+            await asyncio.to_thread(proxy.close)
         await _async_close_sessions(runtime.read_session, runtime.open_session)
+
+
+def _camera_bindings(doors: Mapping[str, Any]) -> tuple[CameraBinding, ...]:
+    """Build only validated account-derived camera bindings."""
+
+    bindings: list[CameraBinding] = []
+    for door in doors.values():
+        if not getattr(door, "trusted", False):
+            continue
+        try:
+            bindings.append(CameraBinding(door.key, door.cctv_number))
+        except (AttributeError, GatewayError):
+            continue
+    return tuple(bindings)
+
+
+def _start_rtsp_proxy(
+    credentials: MediaCredentials, bindings: tuple[CameraBinding, ...]
+) -> RtspProxyRuntime:
+    """Construct and bind the synchronous media stack outside HA's event loop."""
+
+    media_client = UfanetMediaClient(credentials)
+    try:
+        proxy = RtspProxyRuntime(media_client, bindings)
+        proxy.start()
+    except BaseException:
+        media_client.close()
+        raise
+    return proxy
+
+
+async def _async_start_rtsp_proxy(
+    credentials: MediaCredentials, bindings: tuple[CameraBinding, ...]
+) -> RtspProxyRuntime:
+    """Finish or clean up an executor start even if HA cancels setup."""
+
+    start_task = asyncio.create_task(
+        asyncio.to_thread(_start_rtsp_proxy, credentials, bindings)
+    )
+    first_cancellation: asyncio.CancelledError | None = None
+    start_error: BaseException | None = None
+    while not start_task.done():
+        try:
+            await asyncio.shield(start_task)
+        except asyncio.CancelledError as error:
+            if first_cancellation is None:
+                first_cancellation = error
+        except BaseException as error:  # noqa: BLE001
+            start_error = error
+            break
+
+    proxy: RtspProxyRuntime | None = None
+    if start_error is None:
+        try:
+            proxy = start_task.result()
+        except BaseException as error:  # noqa: BLE001
+            start_error = error
+
+    if first_cancellation is not None:
+        if proxy is not None:
+            cleanup_task = asyncio.create_task(asyncio.to_thread(proxy.close))
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:  # noqa: BLE001
+                    break
+        first_cancellation.__cause__ = None
+        first_cancellation.__context__ = None
+        raise first_cancellation from None
+    if start_error is not None:
+        start_error.__cause__ = None
+        start_error.__context__ = None
+        raise start_error from None
+    if proxy is None:
+        raise GatewayError("RTSP proxy start failed")
+    return proxy
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> bool:
@@ -135,6 +229,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> bo
 
     read_session: ClientSession | None = None
     open_session: ClientSession | None = None
+    history_poller: CallHistoryPoller | None = None
+    rtsp_proxy: RtspProxyRuntime | None = None
+    proxy_unsubscribe: Any | None = None
     try:
         read_session = _new_session()
         open_session = _new_session()
@@ -154,14 +251,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> bo
         )
         coordinator = UfanetCoordinator(hass, entry, client)
         await coordinator.async_config_entry_first_refresh()
+        rtsp_proxy = await _async_start_rtsp_proxy(
+            MediaCredentials(entry.data[CONF_CONTRACT], entry.data[CONF_PASSWORD]),
+            _camera_bindings(coordinator.data or {}),
+        )
+
+        active_proxy = rtsp_proxy
+
+        def update_camera_bindings() -> None:
+            active_proxy.replace_bindings(_camera_bindings(coordinator.data or {}))
+
+        proxy_unsubscribe = coordinator.async_add_listener(update_camera_bindings)
+        history_manager = CallHistoryManager((coordinator.data or {}).values())
+        history_poller = CallHistoryPoller(
+            client,
+            history_manager,
+            lambda: (coordinator.data or {}).values(),
+        )
         entry.runtime_data = UfanetRuntimeData(
             client=client,
             coordinator=coordinator,
             read_session=read_session,
             open_session=open_session,
+            history_manager=history_manager,
+            history_poller=history_poller,
+            rtsp_proxy=rtsp_proxy,
+            proxy_unsubscribe=proxy_unsubscribe,
         )
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        await history_poller.async_start()
     except BaseException:
+        if history_poller is not None:
+            await history_poller.async_stop()
+        if callable(proxy_unsubscribe):
+            proxy_unsubscribe()
+        if rtsp_proxy is not None:
+            await asyncio.to_thread(rtsp_proxy.close)
         await _async_close_sessions(read_session, open_session)
         raise
     return True
@@ -218,6 +343,28 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry[Any]) -> b
     if type(version) is not int:
         return False
     if version == 2:
+        if getattr(entry, "minor_version", 1) < 2:
+            # v2 exposed a momentary opening command as a Lock. Home Assistant
+            # cannot change an entity's domain in-place: its registry migration
+            # helper changes only the platform and keeps the old ``lock.*``
+            # domain. Remove the stale legacy row instead; the next Button
+            # platform load recreates ``button.*`` with the same opaque unique
+            # ID and device relationship. The domain change necessarily means
+            # old lock.* entity IDs cannot be preserved; the registry keeps the
+            # old row in deleted_entities as a migration tombstone.
+            from homeassistant.helpers import entity_registry as er
+
+            registry = er.async_get(hass)
+            for registered in er.async_entries_for_config_entry(
+                registry, entry.entry_id
+            ):
+                if (
+                    registered.domain != "lock"
+                    or registered.platform != "ufanet_intercom"
+                ):
+                    continue
+                registry.async_remove(registered.entity_id)
+            hass.config_entries.async_update_entry(entry, minor_version=2)
         return True
     if version != 1:
         return False
@@ -228,5 +375,5 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry[Any]) -> b
     ).decode("ascii")
     data[CONF_TRUSTED_BINDINGS] = {}
     data[CONF_REQUIRES_ACK] = True
-    hass.config_entries.async_update_entry(entry, data=data, version=2)
+    hass.config_entries.async_update_entry(entry, data=data, version=2, minor_version=2)
     return True

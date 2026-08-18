@@ -393,6 +393,36 @@ def test_full_hmac_keys_are_keyed_and_discovered_repr_is_private() -> None:
         assert provider_label not in rendered
 
 
+@pytest.mark.asyncio
+async def test_provider_name_precedence_is_bounded_and_numeric_id_is_never_name() -> (
+    None
+):
+    inventory = [
+        shared_item(1008, custom_name=" Custom ", string_view="View"),
+        shared_item(1009, custom_name=" ", string_view=" View "),
+        shared_item(1010, custom_name=None, string_view=None, address=None),
+        shared_item(1011, custom_name=7, string_view=8, address=" Address "),
+        shared_item(
+            1012,
+            custom_name="x" * 513,
+            string_view="y" * 513,
+            address=" Address fallback ",
+        ),
+    ]
+    client, _, _ = await logged_in_client(inventory)
+    assert [door.display_name for door in client.doors.values()] == [
+        "Custom",
+        "View",
+        "Ufanet intercom",
+        "Address",
+        "Address fallback",
+    ]
+    assert all(
+        str(item["id"]) not in door.display_name
+        for item, door in zip(inventory, client.doors.values(), strict=True)
+    )
+
+
 def test_binding_presence_markers_are_canonical_and_strict() -> None:
     kwargs = {
         "shared_id": 1002,
@@ -861,8 +891,8 @@ async def test_dynamic_four_item_discovery_is_immutable_opaque_and_private() -> 
     assert tuple(door.display_name for door in doors.values()) == (
         "Lobby",
         "Side door",
-        "Ufanet intercom",
-        "Ufanet intercom",
+        "synthetic-private-address",
+        "synthetic-private-address",
     )
     assert tuple(door.openable for door in doors.values()) == (True, True, False, False)
     assert all(door.trusted for door in doors.values())
@@ -1039,6 +1069,44 @@ async def test_discovery_rejects_duplicate_json_keys_nan_and_oversized_body() ->
         client = UfanetClient(session, "c", runtime_secret(), identity_key=IDENTITY_KEY)
         with pytest.raises(UfanetDiscoveryError):
             await client.async_login_and_discover()
+
+
+@pytest.mark.asyncio
+async def test_call_history_get_is_strict_bounded_and_read_only() -> None:
+    history = {
+        "count": 1,
+        "next": None,
+        "previous": None,
+        "results": [
+            {
+                "uuid": "synthetic-history-id",
+                "called_at": "2026-08-13T12:00:00Z",
+                "camera_number": "synthetic-camera",
+                "house_id": 7001,
+                "private": "discarded",
+            }
+        ],
+    }
+    session = FakeSession(
+        json_response(200, valid_login()),
+        json_response(200, [shared_item(1901)]),
+        json_response(200, history),
+    )
+    client = UfanetClient(
+        session,
+        "c",
+        runtime_secret(),
+        identity_key=IDENTITY_KEY,
+        trusted_bindings=trusted_bindings_for([shared_item(1901)]),
+    )
+    await client.async_login_and_discover()
+    page = await client.async_call_history()
+    assert len(page.rows) == 1
+    request = session.requests[-1]
+    assert request.method == "GET"
+    assert request.url.endswith("/api/v1/skuds/call-history/?page=1&page_size=10")
+    assert request.kwargs["allow_redirects"] is False
+    assert request.kwargs["headers"]["Accept"] == "application/json"
 
 
 @pytest.mark.asyncio
