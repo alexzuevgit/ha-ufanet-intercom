@@ -14,10 +14,10 @@ BASE_URL: Final = "https://dom.ufanet.ru"
 AUTH_PATH: Final = "/api/v1/auth/auth_by_contract/"
 REFRESH_PATH: Final = "/api/v1/auth/refresh/"
 DISCOVERY_PATH: Final = "/api/v0/skud/shared/"
-PLATFORMS: Final = ("lock",)
+PLATFORMS: Final = ("button", "binary_sensor", "camera")
 
 CONF_CONTRACT: Final = "contract"
-CONF_PASSWORD: Final = "password"
+CONF_PASSWORD: Final = "password"  # noqa: S105 - config key name, not a secret
 CONF_IDENTITY_KEY: Final = "identity_key"
 CONF_TRUSTED_BINDINGS: Final = "trusted_bindings"
 CONF_REQUIRES_ACK: Final = "requires_ack"
@@ -150,6 +150,8 @@ class DiscoveredDoor:
     binding: str = field(repr=False)
     openable: bool = field(compare=False)
     trusted: bool = field(compare=False)
+    cctv_number: str = field(default="", repr=False, compare=False)
+    house: int | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not _valid_provider_integer(self.shared_id):
@@ -163,6 +165,13 @@ class DiscoveredDoor:
         if not _valid_hmac_hex(self.key) or not _valid_hmac_hex(self.binding):
             raise ValueError("invalid discovered door")
         if type(self.openable) is not bool or type(self.trusted) is not bool:
+            raise ValueError("invalid discovered door")
+        if (
+            type(self.cctv_number) is not str
+            or len(self.cctv_number) > MAX_CCTV_NUMBER_CHARS
+            or type(self.house) not in (int, type(None))
+            or (self.house is not None and not _valid_provider_integer(self.house))
+        ):
             raise ValueError("invalid discovered door")
 
     @property

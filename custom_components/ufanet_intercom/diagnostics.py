@@ -24,4 +24,10 @@ async def async_get_config_entry_diagnostics(
         "openable_trusted_count": sum(
             door.trusted and door.openable for door in doors.values()
         ),
+        "call_history_available": bool(
+            getattr(
+                getattr(entry.runtime_data, "history_manager", None), "available", False
+            )
+        ),
+        "call_history_poll_interval_seconds": 3,
     }

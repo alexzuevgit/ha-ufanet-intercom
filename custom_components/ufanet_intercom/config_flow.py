@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 from homeassistant.core import callback
@@ -103,7 +102,7 @@ def _stored_trusted_bindings(value: object) -> dict[str, str]:
     """Copy a strictly valid stored binding mapping or fail closed."""
 
     if not isinstance(value, Mapping):
-        raise ValueError("Invalid trusted bindings.")
+        raise TypeError("Invalid trusted bindings.")
     bindings = dict(value)
     if any(
         type(key) is not str
@@ -205,6 +204,7 @@ class UfanetIntercomConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Configure and reauthenticate one Ufanet intercom account."""
 
     VERSION = 2
+    MINOR_VERSION = 2
 
     _candidate: _InitialCandidate | None = None
 

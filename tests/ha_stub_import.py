@@ -30,13 +30,17 @@ config_entries = add_module("homeassistant.config_entries")
 core = add_module("homeassistant.core")
 exceptions = add_module("homeassistant.exceptions")
 helpers = add_module("homeassistant.helpers")
+entity_registry = add_module("homeassistant.helpers.entity_registry")
 aiohttp_client = add_module("homeassistant.helpers.aiohttp_client")
 update_coordinator = add_module("homeassistant.helpers.update_coordinator")
 device_registry = add_module("homeassistant.helpers.device_registry")
 entity_platform = add_module("homeassistant.helpers.entity_platform")
 selector = add_module("homeassistant.helpers.selector")
 components = add_module("homeassistant.components")
-lock_component = add_module("homeassistant.components.lock")
+binary_sensor_component = add_module("homeassistant.components.binary_sensor")
+button_component = add_module("homeassistant.components.button")
+camera_component = add_module("homeassistant.components.camera")
+
 diagnostics_component = add_module("homeassistant.components.diagnostics")
 
 
@@ -55,12 +59,14 @@ class ConfigEntry(_Generic):
         options: dict[str, object] | None = None,
         title: str = "Synthetic entry",
         version: int = 1,
+        minor_version: int = 1,
     ) -> None:
         self.entry_id = entry_id
         self.data = {} if data is None else data
         self.options = {} if options is None else options
         self.title = title
         self.version = version
+        self.minor_version = minor_version
         self.runtime_data: object | None = None
         self.unload_callbacks: list[Any] = []
 
@@ -254,17 +260,47 @@ class CoordinatorEntity(_Generic):
     def async_write_ha_state(self) -> None:
         self.state_writes += 1
 
+    def async_on_remove(self, callback: Any) -> None:
+        self._remove_callback = callback
+
+
+class BinarySensorEntity:
+    def __init__(self) -> None:
+        self._remove_callback = None
+
+    def async_on_remove(self, callback: Any) -> None:
+        self._remove_callback = callback
+
+
+class ButtonEntity:
+    def __init__(self) -> None:
+        self._remove_callback = None
+
+    def async_on_remove(self, callback: Any) -> None:
+        self._remove_callback = callback
+
+
+class CameraEntityFeature(enum.IntFlag):
+    ON_OFF = 1
+    STREAM = 2
+
+
+class Camera:
+    def __init__(self) -> None:
+        self.hass: Any = None
+        self._attr_is_on = True
+        self._attr_supported_features = CameraEntityFeature(0)
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def stream_source(self) -> str | None:
+        return None
+
 
 class UpdateFailed(Exception):
     pass
-
-
-class LockEntity:
-    pass
-
-
-class LockEntityFeature(enum.IntFlag):
-    OPEN = 1
 
 
 class TextSelectorType(enum.Enum):
@@ -292,15 +328,21 @@ exceptions.HomeAssistantError = HomeAssistantError
 exceptions.ConfigEntryAuthFailed = ConfigEntryAuthFailed
 exceptions.ConfigEntryNotReady = ConfigEntryNotReady
 aiohttp_client.async_create_clientsession = lambda _hass, **_kwargs: object()
-aiohttp_client.async_get_clientsession = lambda _hass: object()
+aiohttp_client.async_get_clientsession = lambda _hass, **_kwargs: object()
 update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
 update_coordinator.CoordinatorEntity = CoordinatorEntity
 update_coordinator.UpdateFailed = UpdateFailed
+binary_sensor_component.BinarySensorEntity = BinarySensorEntity
+binary_sensor_component.DOMAIN = "binary_sensor"
+button_component.ButtonEntity = ButtonEntity
+button_component.DOMAIN = "button"
+camera_component.Camera = Camera
+camera_component.CameraEntityFeature = CameraEntityFeature
 device_registry.DeviceInfo = dict
+
 entity_platform.AddEntitiesCallback = object
-lock_component.LockEntity = LockEntity
-lock_component.LockEntityFeature = LockEntityFeature
-lock_component.DOMAIN = "lock"
+entity_registry.async_get = lambda _hass: object()
+entity_registry.async_entries_for_config_entry = lambda _registry, _entry_id: ()
 selector.TextSelector = TextSelector
 selector.TextSelectorConfig = TextSelectorConfig
 selector.TextSelectorType = TextSelectorType
@@ -313,10 +355,13 @@ voluptuous.Schema = lambda value: value
 for module_name in (
     "custom_components.ufanet_intercom.const",
     "custom_components.ufanet_intercom.api",
+    "custom_components.ufanet_intercom.history",
     "custom_components.ufanet_intercom.coordinator",
-    "custom_components.ufanet_intercom.config_flow",
-    "custom_components.ufanet_intercom.lock",
-    "custom_components.ufanet_intercom.diagnostics",
     "custom_components.ufanet_intercom",
+    "custom_components.ufanet_intercom.config_flow",
+    "custom_components.ufanet_intercom.button",
+    "custom_components.ufanet_intercom.binary_sensor",
+    "custom_components.ufanet_intercom.camera",
+    "custom_components.ufanet_intercom.diagnostics",
 ):
     importlib.import_module(module_name)

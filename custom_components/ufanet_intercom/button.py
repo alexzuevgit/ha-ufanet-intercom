@@ -1,4 +1,4 @@
-"""Dynamic Ufanet door entities using Home Assistant's lock.open action."""
+"""Dynamic Ufanet door buttons for a momentary opening command."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import asyncio
 from collections import Counter
 from typing import Any
 
-from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN
-from homeassistant.components.lock import LockEntity, LockEntityFeature
+from homeassistant.components.button import DOMAIN as BUTTON_DOMAIN
+from homeassistant.components.button import ButtonEntity
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -31,8 +31,7 @@ async def async_setup_entry(
     entry: UfanetConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Add entities for trusted doors in the current and later snapshots."""
-
+    """Add buttons for trusted doors in the current and later snapshots."""
     runtime = entry.runtime_data
     coordinator = runtime.coordinator
     added_keys: set[str] = set()
@@ -47,11 +46,11 @@ async def async_setup_entry(
 
         added_keys.update(door.key for door in new_doors)
         async_add_entities(
-            UfanetDoorLock(
+            UfanetDoorOpenButton(
                 coordinator,
                 runtime.client,
                 door,
-                display_name=_display_name(door, name_counts[door.display_name]),
+                device_name=_display_name(door, name_counts[door.display_name]),
             )
             for door in new_doors
         )
@@ -62,18 +61,17 @@ async def async_setup_entry(
 
 
 def _display_name(target: DiscoveredDoor, matching_names: int) -> str:
-    """Return a deterministic name without exposing provider identifiers."""
-
+    """Return a deterministic device name without exposing provider identifiers."""
     if target.display_name != _FALLBACK_NAME and matching_names == 1:
         return target.display_name
     return f"{target.display_name} ({target.key[:8]})"
 
 
-class UfanetDoorLock(CoordinatorEntity[UfanetCoordinator], LockEntity):
-    """A momentary door release with no fabricated physical lock state."""
+class UfanetDoorOpenButton(CoordinatorEntity[UfanetCoordinator], ButtonEntity):
+    """A momentary door release with no fabricated persistent door state."""
 
-    _attr_supported_features = LockEntityFeature.OPEN
-    _attr_assumed_state = True
+    _attr_has_entity_name = True
+    _attr_translation_key = "open_door"
 
     def __init__(
         self,
@@ -81,14 +79,14 @@ class UfanetDoorLock(CoordinatorEntity[UfanetCoordinator], LockEntity):
         client: Any,
         target: DiscoveredDoor,
         *,
-        display_name: str | None = None,
+        device_name: str | None = None,
     ) -> None:
         super().__init__(coordinator)
         self._client = client
         self._target = target
         self._attr_unique_id = target.key
-        self.entity_id = f"{LOCK_DOMAIN}.{target.suggested_object_id}"
-        self._attr_name = display_name or target.display_name
+        self._attr_name = device_name or target.display_name
+        self.entity_id = f"{BUTTON_DOMAIN}.{target.suggested_object_id}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, target.key)},
             name=self._attr_name,
@@ -97,15 +95,8 @@ class UfanetDoorLock(CoordinatorEntity[UfanetCoordinator], LockEntity):
         self._do_not_retry = False
 
     @property
-    def is_locked(self) -> bool | None:
-        """Return unknown because Ufanet supplies no physical contact state."""
-
-        return None
-
-    @property
     def available(self) -> bool:
-        """Require successful read-only validation for this exact target."""
-
+        """Require read-only validation for this exact target before pressing."""
         current = (self.coordinator.data or {}).get(self._target.key)
         return bool(
             self._is_acknowledged()
@@ -119,7 +110,6 @@ class UfanetDoorLock(CoordinatorEntity[UfanetCoordinator], LockEntity):
     @property
     def extra_state_attributes(self) -> dict[str, str | bool]:
         """Expose only sanitized command diagnostics."""
-
         return {
             "last_command_outcome": self._last_command_outcome,
             "do_not_retry": self._do_not_retry,
@@ -127,13 +117,11 @@ class UfanetDoorLock(CoordinatorEntity[UfanetCoordinator], LockEntity):
 
     def _is_acknowledged(self) -> bool:
         """Check the config entry's current acknowledgement value exactly."""
-
         entry = self.coordinator.config_entry
         return entry is not None and entry.data.get(CONF_REQUIRES_ACK) is False
 
-    async def async_open(self, **kwargs: Any) -> None:
-        """Execute one fixed Ufanet command through the standard lock.open action."""
-
+    async def async_press(self) -> None:
+        """Send one fixed momentary Ufanet opening command."""
         if not self._is_acknowledged():
             raise HomeAssistantError(_ACKNOWLEDGEMENT_REQUIRED)
 

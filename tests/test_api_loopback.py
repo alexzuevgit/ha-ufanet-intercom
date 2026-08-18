@@ -18,7 +18,7 @@ import pytest
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 from aiohttp.abc import AbstractResolver, ResolveResult
 
-import custom_components.ufanet_intercom.api as api
+from custom_components.ufanet_intercom import api
 from custom_components.ufanet_intercom.api import (
     UfanetOpenError,
     UfanetOpenUnknownOutcome,

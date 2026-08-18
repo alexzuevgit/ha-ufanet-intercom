@@ -56,6 +56,32 @@ The currently validated read-only inventory family is:
 
 - `GET /api/v0/skud/shared/`
 
+## Account-discovered camera transport
+
+Camera support is derived from the same credentials and shared inventory; it is
+not tied to deployment-specific IDs or user-provided URLs.
+
+1. A shared intercom with a validated non-empty `cctv_number` is a camera
+   candidate.
+2. Authenticated `GET /api/v0/contract/` selects the single contract row whose
+   `title` exactly matches the login (case-insensitive) and reads its active
+   `isp_org.cams_server.url`.
+3. The discovered provider-owned HTTPS origin accepts cookie authentication at
+   `POST /api/internal/login/` and a one-camera live lease request at
+   `POST /api/v0/cameras/this/`.
+4. The lease returns a provider-owned media hostname and a short-lived live
+   token. Both remain in process memory. Home Assistant receives only an
+   embedded loopback RTSP URL whose path is the existing opaque account-scoped
+   target key.
+5. The relay permits RTSP-over-TCP only, resolves and pins only public provider
+   addresses, rewrites signed upstream URIs in memory, and rejects any response
+   that still contains the camera number or token.
+
+The camera path is read-only. A portal authentication expiry may be retried
+once before streaming begins; this policy never applies to the physical open
+request. Frigate/go2rtc configuration and user-supplied camera IDs, URLs, and
+tokens are not part of the integration contract.
+
 Public v2 supports only this shared SKUD/intercom family until other families receive separate protocol and physical-mapping validation.
 
 The corresponding shared physical-action shape is documented, but not implemented or invoked by this evidence task:
@@ -75,7 +101,7 @@ No shared-inventory assumptions may be transferred to that separate device/comma
 
 ## Shared-inventory schema
 
-All four sanitized observations were dictionaries, all IDs were unique, and every object contained every field listed below. `integer` means a JSON integer and excludes booleans. The “observed type” column distinguishes values actually present in the schema-only sample from nullable/string semantics exercised only by the synthetic fixture.
+All four sanitized observations were dictionaries, all IDs were unique, and every object contained every field listed below. `integer` means a JSON integer and excludes booleans. The “observed type” column distinguishes values actually present in the schema-only sample from nullable/string semantics exercised only by the synthetic fixture. Unsupported capability-only fields are intentionally omitted, so this table and fixture are a privacy-safe integration subset rather than an exhaustive byte-for-byte provider schema.
 
 | Field | Observed type | Sanitized notes |
 |---|---|---|
@@ -92,7 +118,6 @@ All four sanitized observations were dictionaries, all IDs were unique, and ever
 | `inactivity_reason` | null | Null on all observed items. The fixture keeps this null. |
 | `is_blocked` | boolean | `false` on all observed items; `true` makes a synthetic fixture item non-openable. |
 | `is_fav` | boolean | Feature flag. |
-| `is_support_sip_monitor` | boolean | Feature flag. |
 | `model` | integer | Fixture model codes are synthetic. |
 | `no_sound` | boolean | Feature flag. |
 | `open_in_talk` | string | Fixture values are synthetic placeholders. |
@@ -106,6 +131,18 @@ All four sanitized observations were dictionaries, all IDs were unique, and ever
 | `timeout` | integer | Fixture values are synthetic. |
 
 Other sanitized common observations were `open_type = "http"`, `disable_button = false`, `is_blocked = false`, non-empty `cctv_number`, and empty `relays` on all four items. These observations describe the bounded probe only and must not be generalized into permanent invariants without parser tests and new evidence.
+
+## Observed call-history contract
+
+The integration uses one read-only first-page request per account:
+
+```text
+GET /api/v1/skuds/call-history/?page=1&page_size=10
+```
+
+The exact envelope keys are `count`, `next`, `previous`, and `results`; at most ten rows are retained, and each retained row contains only a bounded opaque `uuid`, timezone-aware `called_at`, bounded `camera_number`, and exact integer `house_id`. Additional response fields are discarded. Duplicate JSON keys, non-finite numbers, malformed values, oversized bodies, redirects, and protocol failures are rejected without exposing the response.
+
+The feed is polled every three seconds by one serialized account-level worker. A startup/recovery baseline is silent. A fresh row is routed only by the exact `(camera_number, house_id)` pair to a unique trusted inventory binding and produces a short **Call detected** observed pulse. It does not claim an active ring or an end-of-call event. Raw row IDs remain only in bounded process memory behind an opaque keyed digest; they are not persisted, logged, or returned by diagnostics.
 
 ## Privacy and safety invariants
 

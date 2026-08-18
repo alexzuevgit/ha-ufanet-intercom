@@ -12,7 +12,7 @@
       },
       "acknowledge": {
         "title": "Acknowledge discovered entrances",
-        "description": "Read-only discovery found {discovered_count} entrances, {distinct_name_count} distinct names, and {duplicate_name_count} duplicate names. Before creating the entry, understand that calling lock.open causes real physical actuation and opens an entrance; exposing this lock to a remote UI, automations, or a voice assistant can also actuate it. Provider-supplied display names may be address-like and can persist in the entity registry, device registry, backups, Recorder/history, remote UI, and voice-assistant metadata. Duplicate names require careful identification. Confirm to trust all discovered bindings.",
+        "description": "Read-only discovery found {discovered_count} entrances, {distinct_name_count} distinct names, and {duplicate_name_count} duplicate names. Before creating the entry, understand that calling button.press causes real physical actuation and opens an entrance; exposing this opening button to a remote UI, automations, or a voice assistant can also actuate it. Provider-supplied display names may be address-like and can persist in the entity registry, device registry, backups, Recorder/history, remote UI, and voice-assistant metadata. Duplicate names require careful identification. Confirm to trust all discovered bindings.",
         "data": {
           "acknowledge": "I acknowledge and trust all discovered entrance bindings"
         }
@@ -36,6 +36,23 @@
       "already_in_progress": "Setup for this Ufanet account is already in progress.",
       "reauth_successful": "Reauthentication succeeded.",
       "unknown": "The setup candidate is no longer available."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "call_detected": {
+        "name": "Call detected"
+      }
+    },
+    "button": {
+      "open_door": {
+        "name": "Open door"
+      }
+    },
+    "camera": {
+      "camera": {
+        "name": "Camera"
+      }
     }
   },
   "options": {

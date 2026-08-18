@@ -118,7 +118,7 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
     assert "резервные копии Home Assistant" in text
     assert "Home Assistant backups" in text
     assert "voice assistant" in text
-    assert "2.0.0rc2" in text
+    assert "2.0.0rc6" in text
     assert "release candidate" in text.casefold()
     assert text.count("python tests/ha_entity_registry_probe.py") == 2
     assert "docs/controlled-rollout-and-rollback.md" in text
@@ -127,7 +127,7 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
     assert "uv run ruff format --check ." in text
     assert "Show beta versions" in text
     assert "Need a different version?" in text
-    assert "v2.0.0rc2" in text
+    assert "v2.0.0rc6" in text
     assert "verify the installed version" in text.casefold()
 
     rollout = _read_utf8(ROOT / "docs" / "controlled-rollout-and-rollback.md")
@@ -137,7 +137,7 @@ def test_readme_is_plain_utf8_markdown_without_nul() -> None:
         "do not retry",
         "at most one explicitly authorized manual",
         "Show beta versions",
-        "v2.0.0rc2",
+        "v2.0.0rc6",
         "verify the installed version",
         "Preferred rollback",
         "restore the complete backup",
