@@ -17,7 +17,7 @@ DISCOVERY_PATH: Final = "/api/v0/skud/shared/"
 PLATFORMS: Final = ("button", "binary_sensor", "camera")
 
 CONF_CONTRACT: Final = "contract"
-CONF_PASSWORD: Final = "password"  # noqa: S105 - config key name, not a secret
+CONF_PASSWORD: Final = "password"
 CONF_IDENTITY_KEY: Final = "identity_key"
 CONF_TRUSTED_BINDINGS: Final = "trusted_bindings"
 CONF_REQUIRES_ACK: Final = "requires_ack"

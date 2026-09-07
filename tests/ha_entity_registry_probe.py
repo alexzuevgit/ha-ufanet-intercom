@@ -22,6 +22,7 @@ from homeassistant.helpers.entity_platform import EntityPlatform
 
 from custom_components.ufanet_intercom.binary_sensor import (
     UfanetCallDetectedBinarySensor,
+    UfanetCodePhraseBinarySensor,
 )
 from custom_components.ufanet_intercom.button import UfanetDoorOpenButton
 from custom_components.ufanet_intercom.camera import UfanetIntercomCamera
@@ -59,6 +60,22 @@ class _CameraProxy:
         if alias != "a" * 64:
             return None
         return f"rtsp://127.0.0.1:18092/{alias}"
+
+
+class _VoiceManager:
+    """Minimal observation-only manager; no audio, STT, or physical method."""
+
+    def available_for(self, _key: object) -> bool:
+        return True
+
+    def configured_for(self, _key: object, _binding: object) -> bool:
+        return True
+
+    def is_on_for(self, _key: object) -> bool:
+        return False
+
+    def add_listener(self, _listener: object) -> object:
+        return lambda: None
 
 
 async def _main() -> None:
@@ -162,6 +179,21 @@ async def _main() -> None:
         assert call_registry_entry is not None
         assert call_registry_entry.unique_id == f"{target.key}_call_detected"
         assert call_registry_entry.device_id == registry_entry.device_id
+
+        voice_entity = UfanetCodePhraseBinarySensor(
+            _Coordinator(entry, target), _VoiceManager(), target
+        )
+        await call_platform._async_add_entity(voice_entity, False, registry, None)
+        voice_registry_entry = registry.async_get(voice_entity.entity_id)
+        assert voice_entity.entity_id == (
+            f"binary_sensor.{target.suggested_object_id}_code_phrase"
+        ), voice_entity.entity_id
+        assert voice_registry_entry is not None
+        assert voice_registry_entry.unique_id == f"{target.key}_code_phrase"
+        assert voice_registry_entry.device_id == registry_entry.device_id
+        assert voice_entity.available is True
+        assert voice_entity.is_on is False
+        assert voice_entity.extra_state_attributes is None
 
         camera = UfanetIntercomCamera(
             _Coordinator(entry, target),

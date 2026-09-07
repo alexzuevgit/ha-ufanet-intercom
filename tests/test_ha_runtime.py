@@ -1,8 +1,7 @@
 """Synthetic tests for the dynamic Home Assistant runtime slice."""
 
-# ruff: noqa: E402
-
 # Imports must follow the dynamic sys.modules/sys.path Home Assistant stub bootstrap.
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -37,6 +36,9 @@ diagnostics_module = importlib.import_module(
 )
 button_module = importlib.import_module("custom_components.ufanet_intercom.button")
 camera_module = importlib.import_module("custom_components.ufanet_intercom.camera")
+binary_sensor_module = importlib.import_module(
+    "custom_components.ufanet_intercom.binary_sensor"
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -61,6 +63,8 @@ from custom_components.ufanet_intercom.const import (
     DOMAIN,
     DiscoveredDoor,
 )
+from custom_components.ufanet_intercom.voice_phrase import encode_phrase_set
+from custom_components.ufanet_intercom.voice_runtime import VOICE_PHRASE_OPTIONS_ROOT
 
 IDENTITY_KEY = bytes(range(32))
 ENCODED_IDENTITY_KEY = base64.urlsafe_b64encode(IDENTITY_KEY).decode("ascii")
@@ -96,6 +100,7 @@ class FakeConfigEntries:
         self.events: list[str] = []
         self.updated: dict[str, Any] | None = None
         self.update_calls: list[tuple[Any, dict[str, Any]]] = []
+        self.reload_calls: list[str] = []
 
     async def async_forward_entry_setups(
         self, entry: Any, platforms: tuple[str, ...]
@@ -114,6 +119,10 @@ class FakeConfigEntries:
         for attribute, value in updates.items():
             setattr(entry, attribute, value)
 
+    async def async_reload(self, entry_id: str) -> bool:
+        self.reload_calls.append(entry_id)
+        return True
+
 
 def config_data(**updates: Any) -> dict[str, Any]:
     data = {
@@ -131,6 +140,30 @@ def acknowledged_entry(**updates: Any) -> ConfigEntry:
     """Return an entry whose current runtime acknowledgement is exact False."""
 
     return ConfigEntry(data=config_data(**updates), version=2, minor_version=2)
+
+
+def enabled_voice_options(target: DiscoveredDoor) -> dict[str, object]:
+    """Return canonical editable options for one synthetic target."""
+
+    return {
+        VOICE_PHRASE_OPTIONS_ROOT: {
+            "version": 1,
+            "enabled": True,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "SYNTHETIC-STT-TOKEN",
+            "model": "synthetic-model",
+            "allow_insecure_http": False,
+            "targets": {
+                target.key: {
+                    "binding": target.binding,
+                    "phrases": encode_phrase_set(
+                        ["синтетическая фраза"], salt=bytes(range(16))
+                    ),
+                    "entered_phrases": ["синтетическая фраза"],
+                }
+            },
+        }
+    }
 
 
 def coordinator_snapshot(
@@ -352,6 +385,8 @@ async def test_setup_owns_two_safe_sessions_and_performs_no_open(
     assert entry.runtime_data.rtsp_proxy.stream_url("a" * 64) is not None
     assert proxy_thread_ids and proxy_thread_ids[0] != event_loop_thread
     assert config_entries.forwarded == [(entry, ("button", "binary_sensor", "camera"))]
+    assert entry.runtime_data.voice_manager is None
+    assert entry.runtime_data.voice_session is None
 
     await asyncio.to_thread(entry.runtime_data.rtsp_proxy.close)
     await read_session.close()
@@ -1085,6 +1120,7 @@ async def test_diagnostics_are_aggregate_only_and_private() -> None:
     entry = SimpleNamespace(
         title="private title",
         data=config_data(**{CONF_REQUIRES_ACK: True}),
+        options=enabled_voice_options(doors["a" * 64]),
         runtime_data=SimpleNamespace(
             coordinator=SimpleNamespace(data=doors, last_update_success=True)
         ),
@@ -1099,6 +1135,9 @@ async def test_diagnostics_are_aggregate_only_and_private() -> None:
         "openable_trusted_count": 1,
         "call_history_available": False,
         "call_history_poll_interval_seconds": 3,
+        "voice_phrase_enabled": False,
+        "voice_phrase_configured_count": 0,
+        "voice_phrase_available_count": 0,
     }
     rendered = repr(result)
     for private in (
@@ -1108,8 +1147,25 @@ async def test_diagnostics_are_aggregate_only_and_private() -> None:
         entry.data[CONF_IDENTITY_KEY],
         "a" * 64,
         "Provider display",
+        "синтетическая фраза",
+        "entered_phrases",
     ):
         assert private not in rendered
+
+    entry.runtime_data.voice_manager = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, target_count=2),
+        available_count=1,
+        token="synthetic-secret-that-must-not-appear",
+        transcript="synthetic transcript that must not appear",
+    )
+    enabled_result = await diagnostics_module.async_get_config_entry_diagnostics(
+        None, entry
+    )
+    assert enabled_result["voice_phrase_enabled"] is True
+    assert enabled_result["voice_phrase_configured_count"] == 2
+    assert enabled_result["voice_phrase_available_count"] == 1
+    assert "synthetic-secret" not in repr(enabled_result)
+    assert "synthetic transcript" not in repr(enabled_result)
 
 
 def forbid_migration_runtime_work(
@@ -1375,3 +1431,458 @@ async def test_two_accounts_isolate_same_provider_camera_on_distinct_relays() ->
     assert entity_a._attr_unique_id != entity_b._attr_unique_id
     assert source_a is not None and "SAME-CAMERA" not in source_a
     assert source_b is not None and "SAME-CAMERA" not in source_b
+
+
+class FakeHistoryManager:
+    def add_listener(self, _listener: Any) -> Any:
+        return lambda: None
+
+    def available_for(self, _key: str) -> bool:
+        return True
+
+    def is_on_for(self, _key: str) -> bool:
+        return False
+
+
+class FakeVoiceManager:
+    def __init__(self, configured: set[tuple[str, str]]) -> None:
+        self.configured = configured
+        self.available: dict[str, bool] = {}
+        self.on: dict[str, bool] = {}
+        self.listeners: list[Any] = []
+
+    def configured_for(self, key: object, binding: object) -> bool:
+        return (key, binding) in self.configured
+
+    def available_for(self, key: object) -> bool:
+        return type(key) is str and self.available.get(key, False)
+
+    def is_on_for(self, key: object) -> bool:
+        return type(key) is str and self.on.get(key, False)
+
+    def add_listener(self, listener: Any) -> Any:
+        self.listeners.append(listener)
+
+        def remove() -> None:
+            self.listeners.remove(listener)
+
+        return remove
+
+    def notify(self) -> None:
+        for listener in tuple(self.listeners):
+            listener()
+
+
+@pytest.mark.asyncio
+async def test_code_phrase_sensor_uses_same_device_and_manager_only_state() -> None:
+    configured = door("a", display_name="Configured entrance")
+    stale = door("b", display_name="Stale entrance", binding_digit="c")
+    untrusted = door("c", trusted=False, display_name="Ignored entrance")
+    coordinator = coordinator_snapshot(
+        {item.key: item for item in (configured, stale, untrusted)}
+    )
+    manager = FakeVoiceManager(
+        {(configured.key, configured.binding), (stale.key, "2" * 64)}
+    )
+    entry = acknowledged_entry()
+    entry.options = enabled_voice_options(configured)
+    entry.runtime_data = SimpleNamespace(
+        coordinator=coordinator,
+        history_manager=FakeHistoryManager(),
+        voice_manager=manager,
+    )
+    batches: list[list[Any]] = []
+
+    await binary_sensor_module.async_setup_entry(
+        None, entry, lambda values: batches.append(list(values))
+    )
+    entities = [entity for batch in batches for entity in batch]
+    phrase_entities = [
+        entity
+        for entity in entities
+        if getattr(entity, "_attr_translation_key", None) == "code_phrase"
+    ]
+    assert len(phrase_entities) == 1
+    entity = phrase_entities[0]
+    assert entity._target is configured
+    assert entity._attr_unique_id == f"{configured.key}_code_phrase"
+    assert entity.entity_id == (
+        f"binary_sensor.{configured.suggested_object_id}_code_phrase"
+    )
+    assert entity._attr_device_info == {
+        "identifiers": {(DOMAIN, configured.key)},
+        "name": "Configured entrance",
+    }
+    assert entity.available is False
+    assert entity.is_on is False
+    assert not hasattr(entity, "extra_state_attributes")
+
+    await entity.async_added_to_hass()
+    manager.available[configured.key] = True
+    manager.on[configured.key] = True
+    manager.notify()
+    assert entity.state_writes == 1
+    assert entity.available is True
+    assert entity.is_on is True
+
+    coordinator.data = MappingProxyType({configured.key: door("a", binding_digit="d")})
+    assert entity.available is False
+    assert entity.is_on is False
+
+
+@pytest.mark.asyncio
+async def test_code_phrase_sensor_is_added_once_when_exact_target_appears() -> None:
+    configured = door("a")
+    coordinator = coordinator_snapshot({})
+    manager = FakeVoiceManager({(configured.key, configured.binding)})
+    entry = acknowledged_entry()
+    entry.runtime_data = SimpleNamespace(
+        coordinator=coordinator,
+        history_manager=FakeHistoryManager(),
+        voice_manager=manager,
+    )
+    batches: list[list[Any]] = []
+
+    await binary_sensor_module.async_setup_entry(
+        None, entry, lambda values: batches.append(list(values))
+    )
+    coordinator.async_set_updated_data(MappingProxyType({configured.key: configured}))
+    coordinator.async_set_updated_data(MappingProxyType({configured.key: configured}))
+
+    phrase_entities = [
+        entity
+        for batch in batches
+        for entity in batch
+        if getattr(entity, "_attr_translation_key", None) == "code_phrase"
+    ]
+    assert len(phrase_entities) == 1
+
+
+@pytest.mark.asyncio
+async def test_voice_cleanup_precedes_provider_and_proxy_cleanup() -> None:
+    events: list[str] = []
+
+    class VoiceManager:
+        async def async_stop(self) -> None:
+            events.append("voice-stop")
+
+    class HistoryPoller:
+        async def async_stop(self) -> None:
+            events.append("history-stop")
+
+    runtime = SimpleNamespace(
+        voice_manager=VoiceManager(),
+        voice_session=LifecycleSession("voice-close", events),
+        history_poller=HistoryPoller(),
+        client=LifecycleClient(events),
+        proxy_unsubscribe=lambda: events.append("proxy-unsubscribe"),
+        rtsp_proxy=LifecycleProxy(events),
+        read_session=LifecycleSession("read-close", events),
+        open_session=LifecycleSession("open-close", events),
+    )
+
+    await runtime_module._async_drain_and_close(runtime)
+
+    assert events[:3] == ["voice-stop", "history-stop", "drain"]
+    assert events[3:5] == ["proxy-unsubscribe", "proxy-close"]
+    assert set(events[5:]) == {"voice-close", "read-close", "open-close"}
+
+
+@pytest.mark.asyncio
+async def test_voice_stop_failure_still_closes_every_owned_resource() -> None:
+    events: list[str] = []
+    failure = RuntimeError("fixed synthetic stop failure")
+
+    class VoiceManager:
+        async def async_stop(self) -> None:
+            events.append("voice-stop")
+            raise failure
+
+    class HistoryPoller:
+        async def async_stop(self) -> None:
+            events.append("history-stop")
+
+    runtime = SimpleNamespace(
+        voice_manager=VoiceManager(),
+        voice_session=LifecycleSession("voice-close", events),
+        history_poller=HistoryPoller(),
+        client=LifecycleClient(events),
+        proxy_unsubscribe=lambda: events.append("proxy-unsubscribe"),
+        rtsp_proxy=LifecycleProxy(events),
+        read_session=LifecycleSession("read-close", events),
+        open_session=LifecycleSession("open-close", events),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await runtime_module._async_drain_and_close(runtime)
+
+    assert raised.value is failure
+    assert events[:3] == ["voice-stop", "history-stop", "drain"]
+    assert "proxy-close" in events
+    assert {"voice-close", "read-close", "open-close"} <= set(events)
+
+
+def test_optional_voice_options_fail_closed_without_runtime_resources() -> None:
+    assert runtime_module._enabled_voice_config({}) is None
+    assert (
+        runtime_module._enabled_voice_config(
+            {VOICE_PHRASE_OPTIONS_ROOT: {"version": 1, "enabled": False}}
+        )
+        is None
+    )
+    assert (
+        runtime_module._enabled_voice_config(
+            {VOICE_PHRASE_OPTIONS_ROOT: {"token": "PRIVATE-MALFORMED-TOKEN"}}
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_enabled_voice_builds_inert_manager_and_dedicated_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = door("a")
+    config = runtime_module._enabled_voice_config(enabled_voice_options(target))
+    assert config is not None
+    setup_calls: list[tuple[Any, str, dict[str, object]]] = []
+
+    async def setup_component(
+        hass: Any, domain: str, config_data: dict[str, object]
+    ) -> bool:
+        setup_calls.append((hass, domain, config_data))
+        return True
+
+    monkeypatch.setattr(
+        sys.modules["homeassistant.setup"], "async_setup_component", setup_component
+    )
+    monkeypatch.setattr(
+        sys.modules["homeassistant.components.ffmpeg"],
+        "get_ffmpeg_manager",
+        lambda _hass: SimpleNamespace(binary="ffmpeg"),
+    )
+    coordinator = coordinator_snapshot({target.key: target})
+    proxy = FakeRtspProxy(target.key)
+
+    async def executor(function: Any, value: object) -> object:
+        return function(value)
+
+    hass = SimpleNamespace(async_add_executor_job=executor)
+    manager, created_session = await runtime_module._async_build_voice_manager(
+        hass, config, coordinator, proxy
+    )
+
+    assert setup_calls == [(hass, "ffmpeg", {})]
+    assert created_session is not None
+    assert runtime_module._session_is_safe(created_session)
+    assert manager is not None
+    assert manager.configured_for(target.key, target.binding)
+    assert manager.worker_count == 0
+    await manager.async_stop()
+    await created_session.close()
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_unavailable_creates_no_stt_session_or_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = door("a")
+    config = runtime_module._enabled_voice_config(enabled_voice_options(target))
+    assert config is not None
+
+    async def setup_component(*_args: Any, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        sys.modules["homeassistant.setup"], "async_setup_component", setup_component
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_new_session",
+        lambda: pytest.fail("STT session must not exist without FFmpeg"),
+    )
+    coordinator = coordinator_snapshot({target.key: target})
+    manager, session = await runtime_module._async_build_voice_manager(
+        SimpleNamespace(), config, coordinator, FakeRtspProxy(target.key)
+    )
+
+    assert session is None
+    assert manager is not None
+    await manager.async_start()
+    await asyncio.sleep(0)
+    assert manager.worker_count == 0
+    assert manager.available_for(target.key) is False
+    await manager.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_setup_publishes_entities_before_voice_start_and_reconciles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = door("a", cctv_number="SYNTHETIC-CAMERA")
+    discovered = MappingProxyType({target.key: target})
+    events: list[str] = []
+
+    class Client:
+        async def async_update_inventory(self) -> Any:
+            return discovered
+
+        async def async_drain(self) -> None:
+            events.append("drain")
+
+    class Manager:
+        started = False
+
+        async def async_start(self) -> None:
+            assert "forward" in events
+            self.started = True
+            events.append("voice-start")
+
+        async def async_stop(self) -> None:
+            events.append("voice-stop")
+
+        def reconcile(self) -> None:
+            events.append("voice-reconcile")
+
+    manager = Manager()
+
+    class Poller:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def async_start(self) -> None:
+            events.append("history-start")
+
+        async def async_stop(self) -> None:
+            events.append("history-stop")
+
+    class ConfigEntries(FakeConfigEntries):
+        async def async_forward_entry_setups(
+            self, entry: Any, platforms: tuple[str, ...]
+        ) -> None:
+            assert entry.runtime_data.voice_manager is manager
+            assert manager.started is False
+            events.append("forward")
+            await super().async_forward_entry_setups(entry, platforms)
+
+    class VoiceSession:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+            events.append("voice-session-close")
+
+    voice_session = VoiceSession()
+
+    async def build_manager(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        events.append("voice-build")
+        return manager, voice_session
+
+    monkeypatch.setattr(
+        runtime_module, "UfanetClient", lambda *_args, **_kwargs: Client()
+    )
+    monkeypatch.setattr(runtime_module, "CallHistoryPoller", Poller)
+    monkeypatch.setattr(runtime_module, "_async_build_voice_manager", build_manager)
+    config_entries = ConfigEntries()
+    hass = SimpleNamespace(config_entries=config_entries)
+    entry = ConfigEntry(
+        data=config_data(),
+        options=enabled_voice_options(target),
+        version=2,
+        minor_version=2,
+    )
+
+    assert await runtime_module.async_setup_entry(hass, entry) is True
+    assert events[:4] == [
+        "voice-build",
+        "forward",
+        "voice-start",
+        "history-start",
+    ]
+    assert len(entry.update_listeners) == 1
+    await entry.update_listeners[0](hass, entry)
+    assert config_entries.reload_calls == [entry.entry_id]
+    entry.runtime_data.coordinator.async_set_updated_data(discovered)
+    assert events[-1] == "voice-reconcile"
+
+    await runtime_module._async_drain_and_close(entry.runtime_data)
+    assert events.index("voice-stop") < events.index("drain")
+    assert voice_session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_setup_rollback_closes_all_resources_after_voice_stop_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = door("a", cctv_number="SYNTHETIC-CAMERA")
+    discovered = MappingProxyType({target.key: target})
+    events: list[str] = []
+    setup_failure = RuntimeError("fixed forwarding failure")
+
+    class Client:
+        async def async_update_inventory(self) -> Any:
+            return discovered
+
+    class Manager:
+        async def async_stop(self) -> None:
+            events.append("voice-stop")
+            raise RuntimeError("fixed cleanup failure")
+
+    class Poller:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        async def async_stop(self) -> None:
+            events.append("history-stop")
+
+    class Proxy(LifecycleProxy):
+        def replace_bindings(self, _bindings: object) -> None:
+            pass
+
+    sessions = [
+        LifecycleSession("read-close", events),
+        LifecycleSession("open-close", events),
+    ]
+    voice_session = LifecycleSession("voice-close", events)
+    proxy = Proxy(events)
+
+    class ConfigEntries(FakeConfigEntries):
+        async def async_forward_entry_setups(
+            self, entry: Any, platforms: tuple[str, ...]
+        ) -> None:
+            del entry, platforms
+            raise setup_failure
+
+    async def build_manager(*_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        return Manager(), voice_session
+
+    monkeypatch.setattr(runtime_module, "_new_session", lambda: sessions.pop(0))
+    monkeypatch.setattr(runtime_module, "_sessions_are_safe", lambda *_args: True)
+    monkeypatch.setattr(
+        runtime_module, "UfanetClient", lambda *_args, **_kwargs: Client()
+    )
+    monkeypatch.setattr(runtime_module, "CallHistoryPoller", Poller)
+    monkeypatch.setattr(
+        runtime_module,
+        "_async_start_rtsp_proxy",
+        lambda *_args: asyncio.sleep(0, result=proxy),
+    )
+    monkeypatch.setattr(runtime_module, "_async_build_voice_manager", build_manager)
+    entry = ConfigEntry(
+        data=config_data(),
+        options=enabled_voice_options(target),
+        version=2,
+        minor_version=2,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await runtime_module.async_setup_entry(
+            SimpleNamespace(config_entries=ConfigEntries()), entry
+        )
+
+    assert raised.value is setup_failure
+    assert "voice-stop" in events
+    assert "history-stop" in events
+    assert "proxy-close" in events
+    assert {"voice-close", "read-close", "open-close"} <= set(events)
+    assert entry.runtime_data is None

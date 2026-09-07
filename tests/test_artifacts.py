@@ -7,11 +7,10 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
-
-import tomllib
 
 import custom_components.ufanet_intercom.const as const_module
 from custom_components.ufanet_intercom.const import (
@@ -301,18 +300,24 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
     assert manifest == {
         "domain": "ufanet_intercom",
         "name": "Ufanet Intercom",
+        "after_dependencies": ["frontend"],
         "codeowners": ["@alexzuevgit"],
         "config_flow": True,
         "documentation": "https://github.com/alexzuevgit/ha-ufanet-intercom",
         "integration_type": "hub",
         "iot_class": "cloud_polling",
         "issue_tracker": "https://github.com/alexzuevgit/ha-ufanet-intercom/issues",
-        "requirements": ["httpx==0.28.1"],
-        "version": "2.0.0rc6",
+        "requirements": [
+            "argon2-cffi==25.1.0",
+            "httpx==0.28.1",
+            "pymicro-vad==1.0.1",
+        ],
+        "version": "2.1.0b7",
     }
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["version"] == manifest["version"]
+    assert project["project"]["dependencies"] == manifest["requirements"]
     assert project["project"]["description"] == (
         "Home Assistant custom integration for account-discovered Ufanet shared "
         "intercoms"
@@ -328,8 +333,8 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
     assert root_packages[0]["version"] == manifest["version"]
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "2.0.0rc6" in readme
-    assert "release candidate" in readme.casefold()
+    assert "2.1.0b7" in readme
+    assert "beta" in readme.casefold()
 
 
 def test_strings_and_translations_cover_complete_v2_flows() -> None:
@@ -357,12 +362,36 @@ def test_strings_and_translations_cover_complete_v2_flows() -> None:
             "reauth_successful",
             "unknown",
         }
-        assert set(options["step"]) == {"init", "adopt"}
-        assert set(options["error"]) == set(config["error"])
+        assert set(options["step"]) == {
+            "init",
+            "bindings",
+            "adopt",
+            "voice_service",
+            "voice_model",
+            "voice_device",
+            "voice_phrases",
+            "voice_phrases_legacy",
+            "voice_reset",
+        }
+        assert set(options["error"]) == set(config["error"]) | {
+            "invalid_stt",
+            "invalid_model",
+            "token_origin_changed",
+            "models_unsupported",
+            "models_unavailable",
+            "models_empty",
+            "voice_service_required",
+            "stale_target",
+            "too_many_targets",
+            "invalid_phrases",
+        }
         assert set(options["abort"]) == {
             "no_pending_targets",
             "adoption_successful",
+            "no_voice_targets",
+            "unknown",
         }
+        assert "code_phrase" in value["entity"]["binary_sensor"]
 
     english_warning = strings["config"]["step"]["acknowledge"]["description"]
     russian_warning = russian["config"]["step"]["acknowledge"]["description"]
@@ -404,6 +433,53 @@ def test_strings_and_translations_cover_complete_v2_flows() -> None:
     )
 
 
+def test_options_menu_names_and_phrase_editor_explain_everyday_actions() -> None:
+    for language, expected_menu in (
+        (
+            "ru",
+            {
+                "voice_service": "Настройки распознавания речи",
+                "voice_device": "Кодовые фразы по домофонам",
+                "bindings": "Обновить список домофонов",
+                "voice_reset": "Сбросить настройки распознавания",
+            },
+        ),
+        (
+            "en",
+            {
+                "voice_service": "Speech recognition settings",
+                "voice_device": "Code phrases by intercom",
+                "bindings": "Refresh intercom list",
+                "voice_reset": "Reset recognition settings",
+            },
+        ),
+    ):
+        options = load_json(COMPONENT / "translations" / f"{language}.json")["options"]
+        steps = options["step"]
+        assert steps["init"]["menu_options"] == expected_menu
+        for step, title in expected_menu.items():
+            assert steps[step]["title"] == title
+            assert steps[step]["description"]
+        for step in ("voice_phrases", "voice_phrases_legacy"):
+            assert set(steps[step]["data"]) == {"phrases", "clear_phrases"}
+            assert "{target_name}" in steps[step]["description"]
+            assert "{phrase_count}" in steps[step]["description"]
+        assert (
+            steps["voice_phrases"]["description"]
+            != steps["voice_phrases_legacy"]["description"]
+        )
+    russian = load_json(COMPONENT / "translations" / "ru.json")["options"]["step"]
+    assert (
+        "показать его текст невозможно"
+        in russian["voice_phrases_legacy"]["description"]
+    )
+    assert (
+        "Пустое поле сохраняет старый список"
+        in russian["voice_phrases_legacy"]["description"]
+    )
+    assert "администратором" in russian["voice_phrases"]["description"]
+
+
 def test_component_surface_is_dynamic_button_and_call_sensor_importable() -> None:
     expected = {
         "__init__.py",
@@ -418,6 +494,13 @@ def test_component_surface_is_dynamic_button_and_call_sensor_importable() -> Non
         "camera.py",
         "media.py",
         "rtsp_proxy.py",
+        "settings_panel.py",
+        "frontend/ufanet-settings.js",
+        "voice_audio.py",
+        "voice_models.py",
+        "voice_phrase.py",
+        "voice_runtime.py",
+        "voice_stt.py",
         "manifest.json",
         "brand/icon.png",
         "strings.json",
@@ -468,6 +551,8 @@ def test_runtime_artifact_declares_two_safe_transports_ack_gate_and_migration() 
     assert {
         "_new_session",
         "_sessions_are_safe",
+        "_async_build_voice_manager",
+        "_async_reload_entry",
         "async_setup_entry",
         "async_migrate_entry",
     } <= functions
@@ -491,6 +576,8 @@ def test_runtime_artifact_declares_two_safe_transports_ack_gate_and_migration() 
         "history_manager",
         "history_poller",
         "rtsp_proxy",
+        "voice_manager",
+        "voice_session",
         "proxy_unsubscribe",
     }
 

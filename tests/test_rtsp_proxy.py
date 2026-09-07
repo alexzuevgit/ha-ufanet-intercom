@@ -12,9 +12,9 @@ from custom_components.ufanet_intercom.media import (
     MediaLease,
 )
 from custom_components.ufanet_intercom.rtsp_proxy import (
+    _MAX_CLIENTS,
     RtspGateway,
     _FrameReader,
-    _MAX_CLIENTS,
     _public_socket_addresses,
     _rewrite_request,
     _rewrite_response,

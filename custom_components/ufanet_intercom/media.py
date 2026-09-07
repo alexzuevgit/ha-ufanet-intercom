@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import Any, Final, Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -123,10 +123,8 @@ def _valid_media_host(host: object) -> bool:
         and not host.startswith(".")
         and not host.endswith(".")
         and (
-            host == "ucams.ufanet.ru"
-            or host.endswith(".ucams.ufanet.ru")
-            or host == "cams.ufanet.ru"
-            or host.endswith(".cams.ufanet.ru")
+            host in {"ucams.ufanet.ru", "cams.ufanet.ru"}
+            or host.endswith((".ucams.ufanet.ru", ".cams.ufanet.ru"))
         )
     )
 
@@ -242,7 +240,7 @@ class UfanetMediaClient:
         self._lock = threading.RLock()
         self._closed = False
 
-    def __enter__(self) -> UfanetMediaClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:
