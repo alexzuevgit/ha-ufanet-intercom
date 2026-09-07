@@ -300,7 +300,7 @@ def test_release_metadata_is_consistent_generic_v2() -> None:
     assert manifest == {
         "domain": "ufanet_intercom",
         "name": "Ufanet Intercom",
-        "after_dependencies": ["frontend"],
+        "after_dependencies": ["ffmpeg", "frontend", "http"],
         "codeowners": ["@alexzuevgit"],
         "config_flow": True,
         "documentation": "https://github.com/alexzuevgit/ha-ufanet-intercom",

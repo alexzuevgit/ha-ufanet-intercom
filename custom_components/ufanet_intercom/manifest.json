@@ -1,7 +1,7 @@
 {
   "domain": "ufanet_intercom",
   "name": "Ufanet Intercom",
-  "after_dependencies": ["frontend"],
+  "after_dependencies": ["ffmpeg", "frontend", "http"],
   "codeowners": ["@alexzuevgit"],
   "config_flow": true,
   "documentation": "https://github.com/alexzuevgit/ha-ufanet-intercom",

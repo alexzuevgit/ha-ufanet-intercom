@@ -314,7 +314,9 @@ def test_panel_asset_contract():
     assert 'type="button" data-action="check"' in source
     assert 'name="model"' in source and 'list="models"' in source
     assert json.loads((root / "manifest.json").read_text())["after_dependencies"] == [
-        "frontend"
+        "ffmpeg",
+        "frontend",
+        "http",
     ]
 
 
