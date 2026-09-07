@@ -85,7 +85,7 @@ def _parse_called_at(value: object) -> datetime:
     if type(value) is not str or not 0 < len(value) <= MAX_HISTORY_TIMESTAMP_CHARS:
         raise _bad()
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError, OverflowError):
         raise _bad() from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:

@@ -42,6 +42,9 @@
     "binary_sensor": {
       "call_detected": {
         "name": "Call detected"
+      },
+      "code_phrase": {
+        "name": "Code phrase detected"
       }
     },
     "button": {
@@ -58,27 +61,97 @@
   "options": {
     "step": {
       "init": {
-        "title": "Check entrance bindings",
-        "description": "Perform read-only discovery to check for bindings that require acknowledgement.",
+        "title": "Ufanet Intercom options",
+        "description": "Set up speech recognition, edit code phrases for each intercom, or refresh the intercom list. Resetting recognition settings is a separate action.",
+        "data": {},
+        "menu_options": {
+          "bindings": "Refresh intercom list",
+          "voice_service": "Speech recognition settings",
+          "voice_device": "Code phrases by intercom",
+          "voice_reset": "Reset recognition settings"
+        }
+      },
+      "bindings": {
+        "title": "Refresh intercom list",
+        "description": "Check the Ufanet intercom list. If new or changed intercoms are found, the form shows their counts and asks you to confirm trust. This check never opens an entrance.",
         "data": {}
       },
       "adopt": {
-        "title": "Acknowledge pending bindings",
-        "description": "Discovery found {pending_count} pending bindings: {new_count} new and {changed_count} changed. Confirm to trust all pending bindings.",
+        "title": "Confirm new and changed intercoms",
+        "description": "Intercoms needing confirmation: {pending_count}; new: {new_count}; changed: {changed_count}. Confirm to trust these intercoms. No entrance will be opened.",
         "data": {
-          "acknowledge": "I acknowledge and trust all pending entrance bindings"
+          "acknowledge": "I trust all listed new and changed intercoms"
+        }
+      },
+      "voice_service": {
+        "title": "Speech recognition settings",
+        "description": "Enter the full speech recognition address and API key. Next retrieves the model list without sending audio or enabling recognition. A blank key keeps the saved key; enter it again when changing servers. Turning recognition off preserves settings and code phrases.",
+        "data": {
+          "enabled": "Enable speech recognition",
+          "endpoint": "STT service URL (endpoint)",
+          "token": "STT token (API key)",
+          "allow_insecure_http": "Allow unencrypted HTTP on the local network"
+        }
+      },
+      "voice_device": {
+        "title": "Code phrases by intercom",
+        "description": "Choose an intercom to view or edit its code phrases. Each list applies only to that intercom’s current camera audio. Editing phrases does not switch recognition on.",
+        "data": {
+          "target": "Intercom"
+        }
+      },
+      "voice_phrases": {
+        "title": "Code phrases",
+        "description": "{target_name} · Stored phrases: {phrase_count}.\n\nUp to 16 phrases, one per line. Edit lines and save. An empty field keeps the list; check the box below to delete it entirely. Deleting the final list stops recognition but keeps STT settings.\n\nPhrase text is stored in Home Assistant configuration for administrator viewing, not in logs. Audio and transcripts are not saved.",
+        "data": {
+          "phrases": "Code phrases (one per line)",
+          "clear_phrases": "Delete all code phrases for this intercom"
+        }
+      },
+      "voice_reset": {
+        "title": "Reset recognition settings",
+        "description": "Disables recognition and deletes the STT endpoint, token, model and all code phrases for this entry. Cameras and other Ufanet settings are unchanged. To pause without deleting, switch recognition off in Speech recognition settings.",
+        "data": {
+          "acknowledge": "I confirm deletion of STT settings and all code phrases"
+        }
+      },
+      "voice_phrases_legacy": {
+        "title": "Code phrases",
+        "description": "{target_name} · Stored phrases: {phrase_count}.\n\nThe old list is preserved, but its text cannot be displayed. Re-enter it once to enable viewing: up to 16 phrases, one per line. An empty field keeps the old list. Check the box below to delete it entirely. Deleting the final list stops recognition but keeps STT settings.\n\nRe-entered text is stored in Home Assistant configuration for administrators, not in logs. Audio and transcripts are not saved.",
+        "data": {
+          "phrases": "Code phrases (one per line)",
+          "clear_phrases": "Delete all code phrases for this intercom"
+        }
+      },
+      "voice_model": {
+        "title": "Recognition model",
+        "description": "Choose a model from the list or enter its exact name manually. A choice is required; no default model is selected for you. If the service offers models for different tasks, choose a speech recognition model. Refreshing the list does not change your saved choice.",
+        "data": {
+          "model": "STT model (required)"
         }
       }
     },
     "error": {
       "cannot_connect": "Cannot connect to Ufanet.",
       "invalid_auth": "Authentication failed.",
-      "invalid_targets": "The discovered entrances could not be validated.",
-      "unknown": "Unexpected validation failure."
+      "invalid_targets": "The intercom list could not be checked.",
+      "unknown": "Unexpected validation failure.",
+      "invalid_stt": "The STT settings are invalid.",
+      "voice_service_required": "First set an endpoint in Speech recognition settings. Recognition can remain off.",
+      "stale_target": "The selected intercom or camera binding changed. Select it again.",
+      "too_many_targets": "No more than eight intercoms can be configured.",
+      "invalid_phrases": "Enter between one and sixteen valid phrases, one per line.",
+      "token_origin_changed": "The STT server changed. Enter an API key again: the saved key is not sent to another origin.",
+      "invalid_model": "Choose a model or enter its exact name without spaces. Empty values and default are not accepted.",
+      "models_unsupported": "The catalog route is unknown for this endpoint path; no request was made. Enter an exact model ID manually.",
+      "models_unavailable": "A valid catalog could not be retrieved (access, network or response error). Settings are unchanged. Enter an exact model ID manually or reopen service settings.",
+      "models_empty": "The catalog contains no suitable IDs. Enter an exact model ID manually; settings are still unchanged."
     },
     "abort": {
-      "no_pending_targets": "No entrance bindings require acknowledgement.",
-      "adoption_successful": "The pending entrance bindings were trusted."
+      "no_pending_targets": "Intercom list checked. No new or changed intercoms need confirmation.",
+      "adoption_successful": "The new and changed intercoms have been confirmed.",
+      "no_voice_targets": "No current trusted intercom with a camera is available.",
+      "unknown": "Setup was interrupted. Open Options again."
     }
   }
 }

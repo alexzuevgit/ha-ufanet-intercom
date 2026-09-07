@@ -15,9 +15,15 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return aggregate counts and fixed booleans only."""
 
-    doors = entry.runtime_data.coordinator.data or {}
+    runtime = entry.runtime_data
+    doors = runtime.coordinator.data or {}
+    voice_manager = getattr(runtime, "voice_manager", None)
+    voice_config = getattr(voice_manager, "config", None)
+    voice_enabled = bool(
+        voice_manager is not None and getattr(voice_config, "enabled", False) is True
+    )
     return {
-        "last_update_success": bool(entry.runtime_data.coordinator.last_update_success),
+        "last_update_success": bool(runtime.coordinator.last_update_success),
         "requires_ack": entry.data.get(CONF_REQUIRES_ACK) is True,
         "discovered_count": len(doors),
         "trusted_count": sum(door.trusted for door in doors.values()),
@@ -25,9 +31,14 @@ async def async_get_config_entry_diagnostics(
             door.trusted and door.openable for door in doors.values()
         ),
         "call_history_available": bool(
-            getattr(
-                getattr(entry.runtime_data, "history_manager", None), "available", False
-            )
+            getattr(getattr(runtime, "history_manager", None), "available", False)
         ),
         "call_history_poll_interval_seconds": 3,
+        "voice_phrase_enabled": voice_enabled,
+        "voice_phrase_configured_count": (
+            getattr(voice_config, "target_count", 0) if voice_enabled else 0
+        ),
+        "voice_phrase_available_count": (
+            getattr(voice_manager, "available_count", 0) if voice_enabled else 0
+        ),
     }

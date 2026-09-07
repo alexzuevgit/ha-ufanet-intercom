@@ -29,6 +29,7 @@ homeassistant = add_module("homeassistant")
 config_entries = add_module("homeassistant.config_entries")
 core = add_module("homeassistant.core")
 exceptions = add_module("homeassistant.exceptions")
+setup_component = add_module("homeassistant.setup")
 helpers = add_module("homeassistant.helpers")
 entity_registry = add_module("homeassistant.helpers.entity_registry")
 aiohttp_client = add_module("homeassistant.helpers.aiohttp_client")
@@ -37,6 +38,7 @@ device_registry = add_module("homeassistant.helpers.device_registry")
 entity_platform = add_module("homeassistant.helpers.entity_platform")
 selector = add_module("homeassistant.helpers.selector")
 components = add_module("homeassistant.components")
+ffmpeg_component = add_module("homeassistant.components.ffmpeg")
 binary_sensor_component = add_module("homeassistant.components.binary_sensor")
 button_component = add_module("homeassistant.components.button")
 camera_component = add_module("homeassistant.components.camera")
@@ -69,11 +71,20 @@ class ConfigEntry(_Generic):
         self.minor_version = minor_version
         self.runtime_data: object | None = None
         self.unload_callbacks: list[Any] = []
+        self.update_listeners: list[Any] = []
 
     def async_on_unload(self, func: Any) -> None:
         """Store a cleanup callback as Home Assistant config entries do."""
 
         self.unload_callbacks.append(func)
+
+    def add_update_listener(self, func: Any) -> Any:
+        self.update_listeners.append(func)
+
+        def remove() -> None:
+            self.update_listeners.remove(func)
+
+        return remove
 
 
 class FlowResultType(enum.StrEnum):
@@ -106,6 +117,17 @@ class _FlowBase:
         }
         if description_placeholders is not None:
             result["description_placeholders"] = description_placeholders
+        result.update(kwargs)
+        return result
+
+    def async_show_menu(
+        self, *, step_id: str, menu_options: list[str], **kwargs: object
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "type": "menu",
+            "step_id": step_id,
+            "menu_options": menu_options,
+        }
         result.update(kwargs)
         return result
 
@@ -260,6 +282,9 @@ class CoordinatorEntity(_Generic):
     def async_write_ha_state(self) -> None:
         self.state_writes += 1
 
+    async def async_added_to_hass(self) -> None:
+        return None
+
     def async_on_remove(self, callback: Any) -> None:
         self._remove_callback = callback
 
@@ -308,13 +333,13 @@ class TextSelectorType(enum.Enum):
 
 
 class TextSelectorConfig:
-    def __init__(self, **_kwargs: object) -> None:
-        pass
+    def __init__(self, **kwargs: object) -> None:
+        self.config = kwargs
 
 
 class TextSelector:
-    def __init__(self, _config: object) -> None:
-        pass
+    def __init__(self, config: object) -> None:
+        self.config = config
 
 
 config_entries.ConfigEntry = ConfigEntry
@@ -327,6 +352,8 @@ core.callback = lambda func: func
 exceptions.HomeAssistantError = HomeAssistantError
 exceptions.ConfigEntryAuthFailed = ConfigEntryAuthFailed
 exceptions.ConfigEntryNotReady = ConfigEntryNotReady
+setup_component.async_setup_component = lambda *_args, **_kwargs: None
+ffmpeg_component.get_ffmpeg_manager = lambda _hass: object()
 aiohttp_client.async_create_clientsession = lambda _hass, **_kwargs: object()
 aiohttp_client.async_get_clientsession = lambda _hass, **_kwargs: object()
 update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
@@ -339,6 +366,9 @@ button_component.DOMAIN = "button"
 camera_component.Camera = Camera
 camera_component.CameraEntityFeature = CameraEntityFeature
 device_registry.DeviceInfo = dict
+device_registry.async_get = lambda _hass: types.SimpleNamespace(
+    async_get_device=lambda **_kwargs: None
+)
 
 entity_platform.AddEntitiesCallback = object
 entity_registry.async_get = lambda _hass: object()
@@ -346,10 +376,14 @@ entity_registry.async_entries_for_config_entry = lambda _registry, _entry_id: ()
 selector.TextSelector = TextSelector
 selector.TextSelectorConfig = TextSelectorConfig
 selector.TextSelectorType = TextSelectorType
+selector.SelectSelector = TextSelector
+selector.SelectSelectorConfig = TextSelectorConfig
 diagnostics_component.async_redact_data = lambda data, _redact: data
 
 voluptuous = add_module("voluptuous")
-voluptuous.Required = lambda key: key
+voluptuous.Required = lambda key, **_kwargs: key
+voluptuous.Optional = lambda key, **_kwargs: key
+voluptuous.In = lambda values: values
 voluptuous.Schema = lambda value: value
 
 for module_name in (

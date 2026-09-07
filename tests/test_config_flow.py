@@ -5,10 +5,9 @@ never instantiate the real client and make every session request method fail.
 """
 
 # Imports must follow the dynamic sys.modules/sys.path Home Assistant stub bootstrap.
+# ruff: noqa: E402
 
 from __future__ import annotations
-
-# ruff: noqa: E402
 
 import asyncio
 import base64
@@ -56,6 +55,11 @@ from custom_components.ufanet_intercom.const import (
     contract_fingerprint,
     discovered_door_binding,
     discovered_door_key,
+)
+from custom_components.ufanet_intercom.voice_phrase import encode_phrase_set
+from custom_components.ufanet_intercom.voice_runtime import (
+    VOICE_PHRASE_OPTIONS_ROOT,
+    parse_voice_phrase_options,
 )
 
 ACKNOWLEDGE = "acknowledge"
@@ -367,7 +371,14 @@ async def prepare_acknowledgement(
 def options_flow_for(entry: ConfigEntry) -> tuple[Any, FakeConfigEntries]:
     handler = config_flow_module.UfanetIntercomConfigFlow.async_get_options_flow(entry)
     entries = FakeConfigEntries(entry)
-    handler.hass = SimpleNamespace(config_entries=entries)
+
+    async def async_add_executor_job(function: Any, *args: object) -> object:
+        return await asyncio.to_thread(function, *args)
+
+    handler.hass = SimpleNamespace(
+        config_entries=entries,
+        async_add_executor_job=async_add_executor_job,
+    )
     handler.context = {"entry_id": entry.entry_id}
     return handler, entries
 
@@ -685,8 +696,10 @@ async def test_exact_ack_creates_only_safe_persistent_candidate_data(
     )
 
     rendered = repr(result)
+    # Raw numeric IDs are excluded structurally above: persistent data has an exact
+    # top-level allowlist and every binding key/value is an exact 64-hex digest.
+    # A short decimal string can legitimately occur inside random digest text.
     for spec in provider.specs:
-        assert str(spec.shared_id) not in rendered
         assert spec.display_name not in rendered
 
 
@@ -872,7 +885,7 @@ async def test_options_with_no_pending_targets_aborts_safely(
     )
     options, entries = options_flow_for(entry)
 
-    result = await options.async_step_init()
+    result = await options.async_step_bindings()
 
     assert result["type"] is FlowResultType.ABORT
     assert re.fullmatch(r"[a-z0-9_]+", result["reason"])
@@ -913,7 +926,7 @@ async def test_options_adoption_confirms_only_aggregates_then_merges_and_reloads
     )
     options, entries = options_flow_for(entry)
 
-    confirmation = await options.async_step_init()
+    confirmation = await options.async_step_bindings()
 
     assert confirmation["type"] is FlowResultType.FORM
     assert_exact_schema(confirmation, {ACKNOWLEDGE})
@@ -980,8 +993,8 @@ async def test_options_failure_and_cancel_both_close_owned_session(
 
     provider.error = UfanetDiscoveryError("private-options-detail")
     options, _entries = options_flow_for(entry)
-    failed = await options.async_step_init()
-    assert_form(failed, "init")
+    failed = await options.async_step_bindings()
+    assert_form(failed, "bindings")
     assert failed["errors"] == {"base": "invalid_targets"}
     assert "private" not in repr(failed).lower()
     assert provider.sessions[-1].closed is True
@@ -991,9 +1004,511 @@ async def test_options_failure_and_cancel_both_close_owned_session(
     provider.error = cancellation
     options, _entries = options_flow_for(entry)
     with pytest.raises(asyncio.CancelledError) as raised:
-        await options.async_step_init()
+        await options.async_step_bindings()
     assert raised.value is cancellation
     assert raised.value.args == ("structured-options-cancel",)
     assert raised.value.__notes__ == ["options-note"]
     assert provider.sessions[-1].closed is True
     assert len(provider.sessions) == 2
+
+
+def voice_door(spec: DoorSpec) -> DiscoveredDoor:
+    key = discovered_door_key(IDENTITY_KEY, spec.shared_id)
+    binding = binding_for(IDENTITY_KEY, spec)
+    return DiscoveredDoor(
+        key=key,
+        shared_id=spec.shared_id,
+        door=0,
+        model=spec.model,
+        display_name=spec.display_name,
+        binding=binding,
+        openable=True,
+        trusted=True,
+        cctv_number=spec.cctv_number,
+    )
+
+
+def voice_entry(
+    target: DiscoveredDoor, *, options: dict[str, Any] | None = None
+) -> ConfigEntry:
+    entry = ConfigEntry(
+        entry_id="voice-entry",
+        data=entry_data(**{CONF_TRUSTED_BINDINGS: {target.key: target.binding}}),
+        options={} if options is None else options,
+        version=2,
+    )
+    entry.runtime_data = SimpleNamespace(
+        coordinator=SimpleNamespace(
+            data=MappingProxyType({target.key: target}),
+            last_update_success=True,
+        ),
+        rtsp_proxy=SimpleNamespace(
+            stream_url=lambda key: (
+                f"rtsp://127.0.0.1:18092/{key}" if key == target.key else None
+            )
+        ),
+    )
+    return entry
+
+
+@pytest.mark.asyncio
+async def test_options_init_is_menu_and_bindings_remain_separate() -> None:
+    target = voice_door(DoorSpec(5101, "Synthetic voice entrance"))
+    options, _entries = options_flow_for(voice_entry(target))
+
+    result = await options.async_step_init()
+
+    assert result["type"] == "menu"
+    assert result["step_id"] == "init"
+    assert result["menu_options"] == [
+        "voice_service",
+        "voice_device",
+        "bindings",
+        "voice_reset",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_voice_service_device_and_phrases_store_admin_configuration() -> None:
+    target = voice_door(DoorSpec(5102, "Synthetic phrase entrance"))
+    entry = voice_entry(target)
+    options, _entries = options_flow_for(entry)
+
+    service = await submit_voice_service(
+        options,
+        {
+            "enabled": True,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "SYNTHETIC-VOICE-TOKEN",
+            "model": "synthetic-model",
+            "allow_insecure_http": False,
+        },
+    )
+    assert_form(service, "voice_device")
+    assert_exact_schema(service, {"target"})
+
+    phrase_form = await options.async_step_voice_device({"target": target.key})
+    assert_form(phrase_form, "voice_phrases")
+    assert_exact_schema(phrase_form, {"phrases", "clear_phrases"})
+    assert "синтетическая кодовая фраза" not in repr(phrase_form)
+
+    result = await options.async_step_voice_phrases(
+        {"phrases": "Синтетическая кодовая фраза\nсинтетическая кодовая фраза!"}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == ""
+    stored = result["data"]
+    parsed = parse_voice_phrase_options(stored)
+    assert parsed.enabled is True
+    assert parsed.configured_targets == ((target.key, target.binding),)
+    assert parsed.phrase_count == 1
+    record = stored[VOICE_PHRASE_OPTIONS_ROOT]["targets"][target.key]
+    assert record["entered_phrases"] == [
+        "Синтетическая кодовая фраза",
+        "синтетическая кодовая фраза!",
+    ]
+    assert "кодовая фраза" not in json.dumps(record["phrases"], ensure_ascii=False)
+    assert "кодовая фраза" not in repr(parsed)
+    assert entry.options == {}
+
+
+@pytest.mark.asyncio
+async def test_blank_token_and_disable_reenable_preserve_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = voice_door(DoorSpec(5103, "Synthetic retained token"))
+    first_entry = voice_entry(target)
+    first_flow, _entries = options_flow_for(first_entry)
+    await submit_voice_service(
+        first_flow,
+        {
+            "enabled": True,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "PRIVATE-RETAINED-TOKEN",
+            "model": "model-a",
+            "allow_insecure_http": False,
+        },
+    )
+    await first_flow.async_step_voice_device({"target": target.key})
+    created = await first_flow.async_step_voice_phrases(
+        {"phrases": "первая синтетическая фраза"}
+    )
+    existing = created["data"]
+
+    entry = voice_entry(target)
+    entry.options = MappingProxyType(existing)
+    options, _entries = options_flow_for(entry)
+    retained = await submit_voice_service(
+        options,
+        {
+            "enabled": True,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "",
+            "model": "model-b",
+            "allow_insecure_http": False,
+        },
+    )
+    assert retained["type"] is FlowResultType.CREATE_ENTRY
+    assert retained["data"][VOICE_PHRASE_OPTIONS_ROOT]["token"] == (
+        "PRIVATE-RETAINED-TOKEN"
+    )
+
+    disabled = await options.async_step_voice_service({"enabled": False})
+    assert disabled["type"] is FlowResultType.CREATE_ENTRY
+    assert disabled["data"][VOICE_PHRASE_OPTIONS_ROOT] == {
+        **existing[VOICE_PHRASE_OPTIONS_ROOT],
+        "enabled": False,
+    }
+    inert = parse_voice_phrase_options(disabled["data"])
+    assert inert.enabled is False
+    assert inert.stt_config is None
+    assert inert.target_count == 0
+    runtime = importlib.import_module("custom_components.ufanet_intercom")
+    assert runtime._enabled_voice_config(disabled["data"]) is None
+    entry.options = disabled["data"]
+    resumed_flow, _entries = options_flow_for(entry)
+    defaults: dict[str, Any] = {}
+
+    def required(key: str, *, default: Any) -> str:
+        defaults[key] = default
+        return key
+
+    with monkeypatch.context() as context:
+        context.setattr(config_flow_module.vol, "Required", required)
+        context.setattr(config_flow_module.vol, "Optional", required)
+        form = await resumed_flow.async_step_voice_service()
+    assert_form(form, "voice_service")
+    assert defaults["enabled"] is False
+    assert defaults["endpoint"] == existing[VOICE_PHRASE_OPTIONS_ROOT]["endpoint"]
+    assert defaults["token"] == ""
+    resumed = await submit_voice_service(
+        resumed_flow, {**defaults, "enabled": True, "model": "model-a"}
+    )
+    assert resumed["type"] is FlowResultType.CREATE_ENTRY
+    assert resumed["data"] == existing
+    assert entry.options == disabled["data"]  # Flow does not mutate storage itself.
+
+
+@pytest.mark.asyncio
+async def test_explicit_clear_last_target_and_stale_binding_is_rejected() -> None:
+    target = voice_door(DoorSpec(5104, "Synthetic clear target"))
+    entry = voice_entry(target)
+    flow, _entries = options_flow_for(entry)
+    await submit_voice_service(
+        flow,
+        {
+            "enabled": True,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "",
+            "model": "synthetic-model",
+            "allow_insecure_http": False,
+        },
+    )
+    await flow.async_step_voice_device({"target": target.key})
+    created = await flow.async_step_voice_phrases(
+        {"phrases": "удаляемая синтетическая фраза"}
+    )
+
+    entry.options = created["data"]
+    clear_flow, _entries = options_flow_for(entry)
+    await clear_flow.async_step_voice_device({"target": target.key})
+    cleared = await clear_flow.async_step_voice_phrases(
+        {"phrases": "", "clear_phrases": True}
+    )
+    assert cleared["data"][VOICE_PHRASE_OPTIONS_ROOT] == {
+        **created["data"][VOICE_PHRASE_OPTIONS_ROOT],
+        "enabled": False,
+        "targets": {},
+    }
+
+    entry.options = created["data"]
+    stale_flow, _entries = options_flow_for(entry)
+    await stale_flow.async_step_voice_device({"target": target.key})
+    entry.runtime_data.coordinator.data = MappingProxyType(
+        {
+            target.key: DiscoveredDoor(
+                key=target.key,
+                shared_id=target.shared_id,
+                door=target.door,
+                model=target.model,
+                display_name=target.display_name,
+                binding="f" * 64,
+                openable=True,
+                trusted=True,
+                cctv_number=target.cctv_number,
+            )
+        }
+    )
+    stale = await stale_flow.async_step_voice_phrases(
+        {"phrases": "новая синтетическая фраза"}
+    )
+    assert_form(stale, "voice_phrases")
+    assert stale["errors"] == {"base": "stale_target"}
+
+
+@pytest.mark.asyncio
+async def test_disabled_phrase_edit_stays_disabled_and_reset_needs_confirmation() -> (
+    None
+):
+    target = voice_door(DoorSpec(5110, "Synthetic paused target"))
+    protected = encode_phrase_set(["синтетическая фраза"])
+    original = {
+        "unrelated": {"keep": True},
+        VOICE_PHRASE_OPTIONS_ROOT: {
+            "version": 1,
+            "enabled": False,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "SYNTHETIC-PAUSED-TOKEN",
+            "model": "",
+            "allow_insecure_http": False,
+            "targets": {target.key: {"binding": target.binding, "phrases": protected}},
+        },
+    }
+    entry = voice_entry(target, options=original)
+    flow, _entries = options_flow_for(entry)
+    selected = await flow.async_step_voice_device({"target": target.key})
+    assert_form(selected, "voice_phrases_legacy")
+    edited = await flow.async_step_voice_phrases(
+        {"phrases": "новая синтетическая фраза"}
+    )
+    assert edited["type"] is FlowResultType.CREATE_ENTRY
+    assert edited["data"][VOICE_PHRASE_OPTIONS_ROOT]["enabled"] is False
+    assert (
+        edited["data"][VOICE_PHRASE_OPTIONS_ROOT]["token"] == "SYNTHETIC-PAUSED-TOKEN"
+    )
+    assert entry.options == original
+    reset, _entries = options_flow_for(entry)
+    for confirmation in (None, {}, {"acknowledge": False}, {"acknowledge": 1}):
+        assert_form(await reset.async_step_voice_reset(confirmation), "voice_reset")
+        assert entry.options == original
+    deleted = await reset.async_step_voice_reset({"acknowledge": True})
+    assert deleted["data"] == {
+        "unrelated": {"keep": True},
+        VOICE_PHRASE_OPTIONS_ROOT: {"version": 1, "enabled": False},
+    }
+
+
+def editable_voice_options(target, *, legacy=False, enabled=True):
+    phrases = ["Синтетическая фраза Один!", "Синтетическая фраза Два"]
+    record = {"binding": target.binding, "phrases": encode_phrase_set(phrases)}
+    if not legacy:
+        record["entered_phrases"] = phrases
+    return {
+        "unrelated": {"keep": True},
+        VOICE_PHRASE_OPTIONS_ROOT: {
+            "version": 1,
+            "enabled": enabled,
+            "endpoint": "https://stt.invalid/v1/audio/transcriptions",
+            "token": "SYNTHETIC-ADMIN-TOKEN",
+            "model": "",
+            "allow_insecure_http": False,
+            "targets": {target.key: record},
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def synthetic_model_catalog(monkeypatch):
+    async def discover(_config):
+        return SimpleNamespace(models=(), error="models_unsupported")
+
+    monkeypatch.setattr(config_flow_module, "async_discover_models", discover)
+
+
+async def submit_voice_service(flow, values):
+    model = values["model"]
+    result = await flow.async_step_voice_service(
+        {k: v for k, v in values.items() if k != "model"}
+    )
+    assert_form(result, "voice_model")
+    return await flow.async_step_voice_model({"model": model})
+
+
+async def phrase_form_defaults(flow, key, monkeypatch):
+    defaults = {}
+
+    def required(key, *, default):
+        defaults[key] = default() if callable(default) else default
+        return key
+
+    with monkeypatch.context() as context:
+        context.setattr(config_flow_module.vol, "Required", required)
+        form = await flow.async_step_voice_device({"target": key})
+    return form, defaults
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_admin_phrase_round_trip_and_edit_preserve_state(
+    enabled, monkeypatch, caplog
+):
+    target = voice_door(DoorSpec(5120, "Synthetic editable entrance"))
+    original = editable_voice_options(target, enabled=enabled)
+    entry = voice_entry(target, options=original)
+    flow, _ = options_flow_for(entry)
+    form, defaults = await phrase_form_defaults(flow, target.key, monkeypatch)
+    assert_form(form, "voice_phrases")
+    assert defaults == {
+        "phrases": "Синтетическая фраза Один!\nСинтетическая фраза Два",
+        "clear_phrases": False,
+    }
+    assert form["description_placeholders"] == {
+        "target_name": target.display_name,
+        "phrase_count": "2",
+    }
+    assert entry.options == original
+    unchanged = await flow.async_step_voice_phrases(defaults)
+    assert unchanged["data"] == original
+    edited_flow, _ = options_flow_for(entry)
+    await edited_flow.async_step_voice_device({"target": target.key})
+    result = await edited_flow.async_step_voice_phrases(
+        {"phrases": "Новая фраза!", "clear_phrases": False}
+    )
+    saved = result["data"][VOICE_PHRASE_OPTIONS_ROOT]
+    assert saved["enabled"] is enabled
+    assert saved["token"] == original[VOICE_PHRASE_OPTIONS_ROOT]["token"]
+    assert saved["targets"][target.key]["entered_phrases"] == ["Новая фраза!"]
+    runtime_options = copy.deepcopy(result["data"])
+    runtime_options[VOICE_PHRASE_OPTIONS_ROOT]["enabled"] = True
+    config = parse_voice_phrase_options(runtime_options)
+    assert config.targets[0].matches("новая фраза")
+    assert not config.targets[0].matches("Синтетическая фраза Один")
+    private_rendering = (
+        repr(config)
+        + repr(config.targets)
+        + repr(edited_flow)
+        + repr(flow._voice_candidate)
+        + caplog.text
+    )
+    assert "Новая фраза" not in private_rendering
+    assert "Синтетическая фраза" not in private_rendering
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [True, False])
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_blank_save_preserves_list_and_explicit_delete_isolated(
+    legacy, enabled, monkeypatch
+):
+    target = voice_door(DoorSpec(5121, "Synthetic preserved entrance"))
+    other = voice_door(DoorSpec(5122, "Synthetic other entrance"))
+    original = editable_voice_options(target, legacy=legacy, enabled=enabled)
+    other_record = editable_voice_options(other)[VOICE_PHRASE_OPTIONS_ROOT]["targets"][
+        other.key
+    ]
+    original[VOICE_PHRASE_OPTIONS_ROOT]["targets"][other.key] = other_record
+    entry = voice_entry(target, options=original)
+    flow, _ = options_flow_for(entry)
+    form, defaults = await phrase_form_defaults(flow, target.key, monkeypatch)
+    assert_form(form, "voice_phrases_legacy" if legacy else "voice_phrases")
+    assert defaults["clear_phrases"] is False
+    if legacy:
+        assert defaults["phrases"] == ""
+    assert form["description_placeholders"]["phrase_count"] == "2"
+    saved = await flow.async_step_voice_phrases(
+        {"phrases": "\n ", "clear_phrases": False}
+    )
+    assert saved["data"] == original
+    assert entry.options == original
+    clear_flow, _ = options_flow_for(entry)
+    await clear_flow.async_step_voice_device({"target": target.key})
+    step = (
+        clear_flow.async_step_voice_phrases_legacy
+        if legacy
+        else clear_flow.async_step_voice_phrases
+    )
+    deleted = await step({"phrases": defaults["phrases"], "clear_phrases": True})
+    assert deleted["data"][VOICE_PHRASE_OPTIONS_ROOT] == {
+        **original[VOICE_PHRASE_OPTIONS_ROOT],
+        "targets": {other.key: other_record},
+    }
+    active = copy.deepcopy(original)
+    active[VOICE_PHRASE_OPTIONS_ROOT]["enabled"] = True
+    parsed_target = parse_voice_phrase_options(active).target_for(target.key)
+    assert parsed_target is not None
+    assert parsed_target.matches("синтетическая фраза один")
+
+
+@pytest.mark.asyncio
+async def test_replaced_binding_never_displays_or_inherits_old_phrases(monkeypatch):
+    target = voice_door(DoorSpec(5123, "Synthetic replacement entrance"))
+    original = editable_voice_options(target)
+    original[VOICE_PHRASE_OPTIONS_ROOT]["targets"][target.key]["binding"] = "f" * 64
+    entry = voice_entry(target, options=original)
+    flow, _ = options_flow_for(entry)
+    form, defaults = await phrase_form_defaults(flow, target.key, monkeypatch)
+    assert_form(form, "voice_phrases")
+    assert defaults["phrases"] == ""
+    assert form["description_placeholders"]["phrase_count"] == "0"
+    invalid = await flow.async_step_voice_phrases(defaults)
+    assert_form(invalid, "voice_phrases")
+    assert invalid["errors"] == {"base": "invalid_phrases"}
+    assert entry.options == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("clear", [None, 1, "true"])
+async def test_phrase_delete_requires_exact_boolean(clear):
+    target = voice_door(DoorSpec(5124, "Synthetic deliberate delete"))
+    original = editable_voice_options(target, legacy=True)
+    entry = voice_entry(target, options=original)
+    flow, _ = options_flow_for(entry)
+    await flow.async_step_voice_device({"target": target.key})
+    invalid = await flow.async_step_voice_phrases(
+        {"phrases": "", "clear_phrases": clear}
+    )
+    assert invalid["type"] is FlowResultType.FORM
+    assert invalid["errors"]
+    assert entry.options == original
+
+
+@pytest.mark.asyncio
+async def test_legacy_one_time_reentry_becomes_viewable(monkeypatch):
+    target = voice_door(DoorSpec(5125, "Synthetic legacy entrance"))
+    entry = voice_entry(target, options=editable_voice_options(target, legacy=True))
+    flow, _ = options_flow_for(entry)
+    await flow.async_step_voice_device({"target": target.key})
+    saved = await flow.async_step_voice_phrases_legacy(
+        {"phrases": "Повторно введённая фраза"}
+    )
+    entry.options = saved["data"]
+    reopened, _ = options_flow_for(entry)
+    form, defaults = await phrase_form_defaults(reopened, target.key, monkeypatch)
+    assert_form(form, "voice_phrases")
+    assert defaults["phrases"] == "Повторно введённая фраза"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fresh", [False, True])
+async def test_service_can_be_configured_and_edited_while_paused(fresh):
+    target = voice_door(DoorSpec(5126, "Synthetic paused setup"))
+    original = {} if fresh else editable_voice_options(target, enabled=False)
+    entry = voice_entry(target, options=original)
+    flow, _ = options_flow_for(entry)
+    submitted = {
+        "enabled": False,
+        "endpoint": "https://stt.invalid/new/v1/audio/transcriptions",
+        "token": "SYNTHETIC-FRESH-TOKEN" if fresh else "",
+        "model": "new-model",
+        "allow_insecure_http": False,
+    }
+    saved = await submit_voice_service(flow, submitted)
+    if fresh:
+        assert_form(saved, "voice_device")
+        await flow.async_step_voice_device({"target": target.key})
+        saved = await flow.async_step_voice_phrases(
+            {"phrases": "Настроено без включения"}
+        )
+    assert saved["type"] is FlowResultType.CREATE_ENTRY
+    root = saved["data"][VOICE_PHRASE_OPTIONS_ROOT]
+    assert root["enabled"] is False
+    assert root["endpoint"] == submitted["endpoint"]
+    assert root["model"] == "new-model"
+    assert root["token"] == (
+        "SYNTHETIC-FRESH-TOKEN" if fresh else "SYNTHETIC-ADMIN-TOKEN"
+    )
+    parsed = parse_voice_phrase_options(saved["data"])
+    assert (
+        parsed.enabled is False and parsed.stt_config is None and parsed.targets == ()
+    )
+    assert entry.options == original

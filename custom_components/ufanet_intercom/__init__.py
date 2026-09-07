@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import secrets
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
@@ -41,6 +42,8 @@ class UfanetRuntimeData:
     history_manager: CallHistoryManager
     history_poller: CallHistoryPoller
     rtsp_proxy: RtspProxyRuntime
+    voice_manager: Any | None = None
+    voice_session: ClientSession | None = None
     proxy_unsubscribe: Any | None = None
 
 
@@ -91,29 +94,35 @@ def _new_session() -> ClientSession:
     return session
 
 
+def _session_is_safe(session: object) -> bool:
+    """Verify one isolated no-retry transport without exposing its purpose."""
+
+    try:
+        return (
+            type(session) is ClientSession
+            and type(session.connector) is TCPConnector
+            and session._retry_connection is False
+            and type(session._middlewares) in (tuple, list)
+            and not session._middlewares
+            and not any(
+                str(name).lower() == "authorization" for name in session.headers
+            )
+            and session.timeout.total is not None
+            and 0 < session.timeout.total <= 30
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _sessions_are_safe(read_session: object, open_session: object) -> bool:
     """Verify the complete read/physical transport separation contract."""
 
     try:
-        sessions = (read_session, open_session)
         return (
-            type(read_session) is ClientSession
-            and type(open_session) is type(read_session)
+            _session_is_safe(read_session)
+            and _session_is_safe(open_session)
             and read_session is not open_session
-            and type(read_session.connector) is TCPConnector
-            and type(open_session.connector) is TCPConnector
             and read_session.connector is not open_session.connector
-            and all(session._retry_connection is False for session in sessions)
-            and all(type(session._middlewares) in (tuple, list) for session in sessions)
-            and all(not session._middlewares for session in sessions)
-            and all(
-                not any(
-                    str(name).lower() == "authorization" for name in session.headers
-                )
-                for session in sessions
-            )
-            and all(session.timeout.total is not None for session in sessions)
-            and all(0 < session.timeout.total <= 30 for session in sessions)
         )
     except Exception:  # noqa: BLE001
         return False
@@ -126,21 +135,142 @@ async def _async_close_sessions(*sessions: ClientSession | None) -> None:
 
 
 async def _async_drain_and_close(runtime: UfanetRuntimeData) -> None:
-    """Stop the account history poller before closing isolated transports."""
+    """Stop every owner in order and report only after terminal cleanup."""
 
-    try:
-        history_poller = getattr(runtime, "history_poller", None)
-        if history_poller is not None:
-            await history_poller.async_stop()
-        await runtime.client.async_drain()
-    finally:
-        unsubscribe = getattr(runtime, "proxy_unsubscribe", None)
-        if callable(unsubscribe):
+    first_error: BaseException | None = None
+
+    async def finish(operation: Awaitable[object]) -> None:
+        nonlocal first_error
+        try:
+            await operation
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            if first_error is None:
+                first_error = error
+
+    voice_manager = getattr(runtime, "voice_manager", None)
+    if voice_manager is not None:
+        await finish(voice_manager.async_stop())
+    history_poller = getattr(runtime, "history_poller", None)
+    if history_poller is not None:
+        await finish(history_poller.async_stop())
+    await finish(runtime.client.async_drain())
+
+    unsubscribe = getattr(runtime, "proxy_unsubscribe", None)
+    if callable(unsubscribe):
+        try:
             unsubscribe()
-        proxy = getattr(runtime, "rtsp_proxy", None)
-        if proxy is not None:
-            await asyncio.to_thread(proxy.close)
-        await _async_close_sessions(runtime.read_session, runtime.open_session)
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            if first_error is None:
+                first_error = error
+    proxy = getattr(runtime, "rtsp_proxy", None)
+    if proxy is not None:
+        await finish(asyncio.to_thread(proxy.close))
+    for session in (
+        getattr(runtime, "voice_session", None),
+        runtime.read_session,
+        runtime.open_session,
+    ):
+        if session is not None:
+            await finish(session.close())
+
+    if first_error is not None:
+        first_error.__cause__ = None
+        first_error.__context__ = None
+        raise first_error from None
+
+
+def _enabled_voice_config(options: object) -> Any | None:
+    """Return validated enabled voice options or fail this optional feature closed."""
+
+    if type(options) not in (dict, MappingProxyType) or "voice_phrase" not in options:
+        return None
+    try:
+        from .voice_runtime import parse_voice_phrase_options
+
+        config = parse_voice_phrase_options(options)
+    except Exception:  # noqa: BLE001 - optional malformed storage stays disabled
+        return None
+    return config if config.enabled else None
+
+
+async def _async_build_voice_manager(
+    hass: HomeAssistant,
+    config: Any,
+    coordinator: UfanetCoordinator,
+    rtsp_proxy: RtspProxyRuntime,
+) -> tuple[Any | None, ClientSession | None]:
+    """Build an inert manager; allocate external resources only when FFmpeg is ready."""
+
+    from .voice_runtime import VoicePhraseManager
+
+    ffmpeg_binary: str | None = None
+    stt_client: Any | None = None
+    voice_session: ClientSession | None = None
+    try:
+        from homeassistant.components.ffmpeg import get_ffmpeg_manager
+        from homeassistant.setup import async_setup_component
+
+        if await async_setup_component(hass, "ffmpeg", {}) is True:
+            candidate = get_ffmpeg_manager(hass).binary
+            if type(candidate) is str and candidate and "\x00" not in candidate:
+                ffmpeg_binary = candidate
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - optional infrastructure stays unavailable
+        ffmpeg_binary = None
+
+    if ffmpeg_binary is not None:
+        try:
+            from .voice_stt import SttClient
+
+            stt_config = config.stt_config
+            if stt_config is not None:
+                voice_session = _new_session()
+                if _session_is_safe(voice_session):
+                    stt_client = SttClient(voice_session, stt_config)
+                else:
+                    await voice_session.close()
+                    voice_session = None
+                    ffmpeg_binary = None
+        except asyncio.CancelledError:
+            if voice_session is not None:
+                await voice_session.close()
+            raise
+        except Exception:  # noqa: BLE001 - optional STT stays unavailable
+            if voice_session is not None:
+                await voice_session.close()
+            voice_session = None
+            stt_client = None
+            ffmpeg_binary = None
+
+    kwargs: dict[str, Any] = {}
+    async_executor = getattr(hass, "async_add_executor_job", None)
+    if callable(async_executor):
+        kwargs["async_executor"] = async_executor
+    try:
+        manager = VoicePhraseManager(
+            config,
+            snapshot_provider=lambda: coordinator.data or {},
+            stream_url_provider=rtsp_proxy.stream_url,
+            ffmpeg_binary=ffmpeg_binary,
+            stt_client=stt_client,
+            **kwargs,
+        )
+    except asyncio.CancelledError:
+        if voice_session is not None:
+            await voice_session.close()
+        raise
+    except Exception:  # noqa: BLE001 - optional feature cannot block the entry
+        if voice_session is not None:
+            await voice_session.close()
+        return None, None
+    return manager, voice_session
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> None:
+    """Reload one entry after its optional voice settings change."""
+
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 def _camera_bindings(doors: Mapping[str, Any]) -> tuple[CameraBinding, ...]:
@@ -221,14 +351,39 @@ async def _async_start_rtsp_proxy(
     return proxy
 
 
+async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+    """Expose settings independently of provider login, only if HA has a UI."""
+    from homeassistant.const import EVENT_COMPONENT_LOADED
+
+    async def register() -> None:
+        from .settings_panel import async_register_settings_panel
+
+        await async_register_settings_panel(hass)
+
+    if "frontend" in hass.config.components:
+        await register()
+    else:
+
+        async def frontend_loaded(event: Any) -> None:
+            if event.data.get("component") == "frontend":
+                unsubscribe()
+                await register()
+
+        unsubscribe = hass.bus.async_listen(EVENT_COMPONENT_LOADED, frontend_loaded)
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> bool:
     """Set up a validated Ufanet account without performing physical actions."""
 
     if entry.data.get(CONF_REQUIRES_ACK) is not False:
         raise ConfigEntryNotReady(_ACKNOWLEDGEMENT_REQUIRED)
 
+    voice_config = _enabled_voice_config(getattr(entry, "options", {}))
     read_session: ClientSession | None = None
     open_session: ClientSession | None = None
+    voice_session: ClientSession | None = None
+    voice_manager: Any | None = None
     history_poller: CallHistoryPoller | None = None
     rtsp_proxy: RtspProxyRuntime | None = None
     proxy_unsubscribe: Any | None = None
@@ -257,9 +412,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> bo
         )
 
         active_proxy = rtsp_proxy
+        if voice_config is not None:
+            voice_manager, voice_session = await _async_build_voice_manager(
+                hass, voice_config, coordinator, active_proxy
+            )
+        active_voice_manager = voice_manager
 
         def update_camera_bindings() -> None:
-            active_proxy.replace_bindings(_camera_bindings(coordinator.data or {}))
+            try:
+                active_proxy.replace_bindings(_camera_bindings(coordinator.data or {}))
+            finally:
+                if active_voice_manager is not None:
+                    active_voice_manager.reconcile()
 
         proxy_unsubscribe = coordinator.async_add_listener(update_camera_bindings)
         history_manager = CallHistoryManager((coordinator.data or {}).values())
@@ -276,19 +440,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: UfanetConfigEntry) -> bo
             history_manager=history_manager,
             history_poller=history_poller,
             rtsp_proxy=rtsp_proxy,
+            voice_manager=voice_manager,
+            voice_session=voice_session,
             proxy_unsubscribe=proxy_unsubscribe,
         )
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        if voice_manager is not None:
+            await voice_manager.async_start()
         await history_poller.async_start()
-    except BaseException:
+        add_update_listener = getattr(entry, "add_update_listener", None)
+        async_on_unload = getattr(entry, "async_on_unload", None)
+        if callable(add_update_listener) and callable(async_on_unload):
+            async_on_unload(add_update_listener(_async_reload_entry))
+    except BaseException as setup_error:
+
+        async def finish_setup_cleanup(operation: Awaitable[object]) -> None:
+            try:
+                await operation
+            except BaseException:  # noqa: BLE001, S110 - preserve original outcome
+                pass
+
+        if voice_manager is not None:
+            await finish_setup_cleanup(voice_manager.async_stop())
         if history_poller is not None:
-            await history_poller.async_stop()
+            await finish_setup_cleanup(history_poller.async_stop())
         if callable(proxy_unsubscribe):
-            proxy_unsubscribe()
+            try:
+                proxy_unsubscribe()
+            except BaseException:  # noqa: BLE001, S110 - continue terminal cleanup
+                pass
         if rtsp_proxy is not None:
-            await asyncio.to_thread(rtsp_proxy.close)
-        await _async_close_sessions(read_session, open_session)
-        raise
+            await finish_setup_cleanup(asyncio.to_thread(rtsp_proxy.close))
+        for session in (voice_session, read_session, open_session):
+            if session is not None:
+                await finish_setup_cleanup(session.close())
+        entry.runtime_data = None
+        setup_error.__cause__ = None
+        setup_error.__context__ = None
+        raise setup_error from None
     return True
 
 

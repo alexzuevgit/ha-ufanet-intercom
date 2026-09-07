@@ -245,11 +245,13 @@ def test_invalid_or_ambiguous_account_media_origin_fails_closed(
             return response_json(200, profile)
         raise AssertionError("invalid profile must fail before portal login")
 
-    with UfanetMediaClient(
-        credentials(), transport=httpx.MockTransport(handler)
-    ) as client:
-        with pytest.raises(GatewayError, match=r"^media account metadata is invalid$"):
-            client.get_lease(CameraBinding(ALIAS, CAMERA))
+    with (
+        UfanetMediaClient(
+            credentials(), transport=httpx.MockTransport(handler)
+        ) as client,
+        pytest.raises(GatewayError, match=r"^media account metadata is invalid$"),
+    ):
+        client.get_lease(CameraBinding(ALIAS, CAMERA))
 
 
 @pytest.mark.parametrize(
@@ -264,12 +266,14 @@ def test_invalid_binding_is_rejected_before_network(
     factory: Callable[[], object],
 ) -> None:
     calls: list[httpx.Request] = []
-    with UfanetMediaClient(
-        credentials(),
-        transport=httpx.MockTransport(lambda request: calls.append(request)),
+    with (
+        UfanetMediaClient(
+            credentials(),
+            transport=httpx.MockTransport(lambda request: calls.append(request)),
+        ),
+        pytest.raises(GatewayError),
     ):
-        with pytest.raises(GatewayError):
-            factory()
+        factory()
     assert calls == []
 
 
@@ -294,12 +298,12 @@ def test_mismatched_or_hostile_lease_metadata_is_fixed_detail() -> None:
             },
         )
 
-    with UfanetMediaClient(
-        credentials(), transport=httpx.MockTransport(handler)
-    ) as client:
-        with pytest.raises(
-            GatewayError, match=r"^media metadata is invalid$"
-        ) as caught:
-            client.get_lease(CameraBinding(ALIAS, CAMERA))
+    with (
+        UfanetMediaClient(
+            credentials(), transport=httpx.MockTransport(handler)
+        ) as client,
+        pytest.raises(GatewayError, match=r"^media metadata is invalid$") as caught,
+    ):
+        client.get_lease(CameraBinding(ALIAS, CAMERA))
     assert CAMERA not in str(caught.value)
     assert SECRET not in str(caught.value)
